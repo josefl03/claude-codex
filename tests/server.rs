@@ -714,6 +714,11 @@ async fn anthropic_bodies_over_limit_return_request_too_large() {
 
 #[tokio::test]
 async fn known_model_reaches_codex_provider() {
+    // Hermetic: no Codex login, so the provider fails on auth without any
+    // network call (it must never use the developer's real ~/.codex login).
+    let dir = tempfile::tempdir().unwrap();
+    let previous = std::env::var_os("CCP_CODEX_AUTH_FILE");
+    unsafe { std::env::set_var("CCP_CODEX_AUTH_FILE", dir.path().join("no-auth.json")) };
     let app = app(Arc::new(Registry::with_default_alias()));
     let response = app
         .oneshot(
@@ -729,6 +734,12 @@ async fn known_model_reaches_codex_provider() {
         .await
         .unwrap();
 
+    unsafe {
+        match previous {
+            Some(v) => std::env::set_var("CCP_CODEX_AUTH_FILE", v),
+            None => std::env::remove_var("CCP_CODEX_AUTH_FILE"),
+        }
+    }
     // Codex provider is now concrete, so it should attempt auth before returning 501
     let status = response.status();
     assert!(
@@ -1573,4 +1584,219 @@ async fn models_endpoint_tolerates_unknown_query_params() {
     let app = app(Arc::new(Registry::with_default_alias()));
     let (status, _) = get_models(app, "/v1/models?limit=1000&after_id=x").await;
     assert_eq!(status, StatusCode::OK);
+}
+
+// ---------- `-latest` aliases ----------
+
+type CapturedModels = Arc<Mutex<Vec<(&'static str, Option<String>)>>>;
+
+struct ModelCaptureProvider {
+    models: Vec<String>,
+    captured: CapturedModels,
+}
+
+#[async_trait]
+impl Provider for ModelCaptureProvider {
+    fn name(&self) -> &'static str {
+        "codex"
+    }
+
+    fn supported_models(&self) -> Vec<String> {
+        self.models.clone()
+    }
+
+    fn cli(&self) -> &'static dyn CliHandlers {
+        &FAKE_CLI
+    }
+
+    async fn handle_messages(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.captured.lock().unwrap().push(("messages", body.model));
+        (StatusCode::OK, "captured").into_response()
+    }
+
+    async fn handle_count_tokens(
+        &self,
+        body: MessagesRequest,
+        _ctx: RequestContext,
+    ) -> axum::response::Response {
+        self.captured
+            .lock()
+            .unwrap()
+            .push(("count_tokens", body.model));
+        (StatusCode::OK, "counted").into_response()
+    }
+}
+
+fn latest_app(models: &[&str]) -> (axum::Router, CapturedModels) {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let provider = Arc::new(ModelCaptureProvider {
+        models: models.iter().map(|m| m.to_string()).collect(),
+        captured: captured.clone(),
+    }) as Arc<dyn Provider>;
+    (
+        app(Arc::new(Registry::from_providers(
+            AliasProvider::Anthropic,
+            [provider],
+        ))),
+        captured,
+    )
+}
+
+async fn post_json(app: &axum::Router, path: &str, body: Value) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
+}
+
+const LATEST_MODELS: &[&str] = &[
+    "gpt-5.6-sol",
+    "gpt-6-sol",
+    "gpt-6.1-sol",
+    "gpt-6.1-sol-fast",
+    "gpt-6-luna",
+    "gpt-5.6-terra",
+];
+
+#[tokio::test]
+async fn latest_aliases_reach_the_provider_as_the_real_model() {
+    let (app, captured) = latest_app(LATEST_MODELS);
+    let message = |model: &str| json!({"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]});
+
+    for (alias, real) in [
+        ("gpt-sol-latest", "gpt-6.1-sol"),
+        ("gpt-latest", "gpt-6.1-sol"),
+        ("gpt-luna-latest", "gpt-6-luna"),
+        ("gpt-terra-latest", "gpt-5.6-terra"),
+        ("gpt-sol-latest[1m]", "gpt-6.1-sol"),
+        ("gpt-6-sol", "gpt-6-sol"),
+    ] {
+        captured.lock().unwrap().clear();
+        let (status, _) = post_json(&app, "/v1/messages", message(alias)).await;
+        assert_eq!(status, StatusCode::OK, "{alias}");
+        assert_eq!(
+            *captured.lock().unwrap(),
+            vec![("messages", Some(real.to_string()))],
+            "{alias}"
+        );
+    }
+
+    // The same resolution happens on the count_tokens route.
+    captured.lock().unwrap().clear();
+    let (status, _) = post_json(&app, "/v1/messages/count_tokens", message("gpt-sol-latest")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        *captured.lock().unwrap(),
+        vec![("count_tokens", Some("gpt-6.1-sol".to_string()))]
+    );
+}
+
+#[tokio::test]
+async fn an_alias_without_candidates_is_a_clear_400_on_both_routes() {
+    let (app, captured) = latest_app(LATEST_MODELS);
+    for path in ["/v1/messages", "/v1/messages/count_tokens"] {
+        for alias in ["gpt-nova-latest", "gpt-astro-latest"] {
+            let (status, body) = post_json(
+                &app,
+                path,
+                json!({"model": alias, "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {alias}");
+            let message = body["error"]["message"].as_str().unwrap();
+            assert!(
+                message.contains(&format!("No model matches the alias \"{alias}\"")),
+                "{message}"
+            );
+            assert!(message.contains("gpt-sol-latest"), "{message}");
+        }
+    }
+    assert!(captured.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn models_listing_shows_the_aliases_unless_they_are_switched_off() {
+    let list = |app: axum::Router| async move {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let listing: Value = serde_json::from_slice(&bytes).unwrap();
+        listing["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| {
+                (
+                    m["id"].as_str().unwrap().to_string(),
+                    m["display_name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let (app_on, _) = latest_app(LATEST_MODELS);
+    let on = list(app_on).await;
+    let sol = on.iter().find(|(id, _)| id == "gpt-sol-latest").unwrap();
+    assert!(sol.1.contains("alias of gpt-6.1-sol"), "{sol:?}");
+    assert!(on.iter().any(|(id, _)| id == "gpt-latest"));
+    assert!(on.iter().any(|(id, _)| id == "gpt-6-sol"));
+
+    let previous = std::env::var_os("CCP_LATEST_ALIASES");
+    unsafe { std::env::set_var("CCP_LATEST_ALIASES", "0") };
+    let (app_off, captured) = latest_app(LATEST_MODELS);
+    let off = list(app_off.clone()).await;
+    let (status, body) = post_json(
+        &app_off,
+        "/v1/messages",
+        json!({"model": "gpt-sol-latest", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    unsafe {
+        match previous {
+            Some(v) => std::env::set_var("CCP_LATEST_ALIASES", v),
+            None => std::env::remove_var("CCP_LATEST_ALIASES"),
+        }
+    }
+    assert!(
+        off.iter().all(|(id, _)| !id.ends_with("-latest")),
+        "{off:?}"
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Unknown model"),
+        "{body}"
+    );
+    assert!(captured.lock().unwrap().is_empty());
 }

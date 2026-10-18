@@ -53,6 +53,7 @@ fn models_include_listed_codex_cli_cache_entries() -> Result<(), Box<dyn std::er
     )?;
     let mut cmd = Command::cargo_bin("claude-codex")?;
     cmd.env("CCP_CODEX_AUTH_FILE", dir.path().join("auth.json"));
+    cmd.env("XDG_STATE_HOME", dir.path().join("state"));
     cmd.arg("models");
     let out = String::from_utf8(cmd.output()?.stdout)?;
     assert!(out.contains("gpt-7-toy, gpt-7-toy-fast"));
@@ -217,6 +218,7 @@ fn plain_service_exits_on_second_signal(signal: &str) -> Result<(), Box<dyn std:
     let port = TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let child = std::process::Command::new(env!("CARGO_BIN_EXE_claude-codex"))
         .args(["serve", "--no-monitor", "--port", &port.to_string()])
+        .env("CCP_AGENT_CARDS", "0")
         .env("CCP_CONFIG_DIR", config.path())
         .env("CCP_KIMI_BASE_URL", upstream_url)
         .env("NO_PROXY", "127.0.0.1,localhost")
@@ -273,5 +275,76 @@ fn kimi_auth_status_reads_stored_auth() -> Result<(), Box<dyn std::error::Error>
     cmd.args(["kimi", "auth", "status"]);
     cmd.env("CCP_CONFIG_DIR", temp.path());
     cmd.assert().success().stdout(contains("User: u"));
+    Ok(())
+}
+
+#[test]
+fn service_install_writes_unit_into_injected_dir() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = TempDir::new()?;
+    let cfg = TempDir::new()?;
+    let mut cmd = Command::cargo_bin("claude-codex")?;
+    cmd.env("CCP_SERVICE_DIR", dir.path())
+        .env("CCP_CONFIG_DIR", cfg.path())
+        .args(["service", "install"])
+        .assert()
+        .success();
+    let name = if cfg!(target_os = "macos") {
+        "com.claude-codex.proxy.plist"
+    } else {
+        "claude-codex.service"
+    };
+    let content = std::fs::read_to_string(dir.path().join(name))?;
+    assert!(content.contains("--no-monitor"));
+
+    let mut cmd = Command::cargo_bin("claude-codex")?;
+    cmd.env("CCP_SERVICE_DIR", dir.path())
+        .env("CCP_CONFIG_DIR", cfg.path())
+        .args(["service", "status"])
+        .assert()
+        .success()
+        .stdout(contains("installed: yes"));
+
+    let mut cmd = Command::cargo_bin("claude-codex")?;
+    cmd.env("CCP_SERVICE_DIR", dir.path())
+        .env("CCP_CONFIG_DIR", cfg.path())
+        .args(["service", "uninstall"])
+        .assert()
+        .success();
+    assert!(!dir.path().join(name).exists());
+    Ok(())
+}
+
+#[test]
+fn agents_sync_list_clean_only_touch_managed_cards() -> Result<(), Box<dyn std::error::Error>> {
+    let codex = tempfile::tempdir()?;
+    let agents = tempfile::tempdir()?;
+    std::fs::write(
+        codex.path().join("models_cache.json"),
+        r#"{"models":[{"slug":"gpt-7-toy","visibility":"list","supported_in_api":true}]}"#,
+    )?;
+    std::fs::write(agents.path().join("foo.md"), "mine")?;
+    let run = |args: &[&str]| -> Result<String, Box<dyn std::error::Error>> {
+        let mut cmd = Command::cargo_bin("claude-codex")?;
+        cmd.env("CCP_CODEX_AUTH_FILE", codex.path().join("auth.json"))
+            .env("CCP_AGENTS_DIR", agents.path())
+            .env("XDG_STATE_HOME", codex.path().join("state"))
+            .args(args);
+        Ok(String::from_utf8(cmd.output()?.stdout)?)
+    };
+
+    run(&["agents", "sync", "--dry-run"])?;
+    assert!(!agents.path().join("gpt-7-toy.md").exists());
+    run(&["agents", "sync"])?;
+    let card = std::fs::read_to_string(agents.path().join("gpt-7-toy.md"))?;
+    assert!(card.contains("model: gpt-7-toy"));
+    assert!(run(&["agents", "list"])?.contains("gpt-7-toy.md"));
+    assert!(!agents.path().join("haiku.md").exists());
+
+    run(&["agents", "clean"])?;
+    assert!(!agents.path().join("gpt-7-toy.md").exists());
+    assert_eq!(
+        std::fs::read_to_string(agents.path().join("foo.md"))?,
+        "mine"
+    );
     Ok(())
 }

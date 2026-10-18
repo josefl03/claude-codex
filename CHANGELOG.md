@@ -1,3 +1,72 @@
+## Unreleased
+
+- `claude-codex enable`, `disable` and `status`. `enable` is the idempotent
+  switch-on (it is `setup` under another name, plus clearing the `disabled`
+  marker): service installed, enabled and started, cards synced,
+  `ANTHROPIC_BASE_URL` in Claude Code's `settings.json` with the same safety
+  rules. `disable` switches off without uninstalling: it stops and disables the
+  service (the unit file stays), removes the managed cards and takes the
+  `settings.json` entries it added out again (restoring a replaced value), keeps
+  the binary, logins, caches and `setup.json`, and warns about a manual `serve`
+  without killing it. A `disabled` marker in the state directory stops `serve`
+  from syncing cards meanwhile. `status` shows enabled state, service, port,
+  settings, card count, version and Codex login. `setup` and `setup --undo` keep
+  working; `scripts/install.sh` now runs `enable`. New `service disable`.
+- Agent cards are now generated only for Codex models by default;
+  `CCP_AGENT_CARD_PROVIDERS` (comma-separated, default `codex`) picks the
+  providers. The next sync removes managed cards of providers that are not
+  listed; unmarked files are never touched.
+- `<family>-latest` and `<family>-<tier>-latest` model aliases for the Codex `gpt`
+  models (for example `gpt-sol-latest`), resolved by the
+  proxy on every request, listed in `/v1/models` and `claude-codex models`, and
+  given subagent cards whose `model:` never changes. `CCP_LATEST_ALIASES=0`
+  disables them. The `opus`, `sonnet`, `haiku` and `fable` aliases are unchanged.
+- `claude-codex service install|uninstall|status|restart` manages an autostart
+  service (systemd user unit on Linux, LaunchAgent on macOS).
+- `claude-codex agents sync|list|clean`, and a background sync in `serve`,
+  keep one `<model>.md` subagent card per non-Claude model in
+  `~/.claude/agents/`, so any model can be used as a Claude Code subagent. Only
+  files carrying the `managed-by: claude-codex` marker are touched.
+- `claude-codex uninstall` removes what `setup` and `scripts/install.sh`
+  installed: the service, the managed cards, the `settings.json` keys recorded in
+  `setup.json` (restored exactly, `.bak` left in place) and the binary (only from
+  a known install directory, never from `target/`). `--dry-run`, `--yes`
+  (required without a terminal), `--keep-binary`, `--purge` (state directory)
+  and `--purge-credentials` (the proxy's own provider logins; `~/.codex` is never
+  touched). A failed step does not stop the others and sets a non-zero exit code.
+- `setup` treats `localhost`, `127.0.0.1` and `[::1]` (with or without a
+  trailing slash) on the proxy's port as the same `ANTHROPIC_BASE_URL`: nothing
+  is changed or reported, and `--undo` leaves the key alone.
+- Agent cards are now named `<model>.md` (name `<model>`) instead of
+  `ccp-<model>.md`. Ownership comes only from the `managed-by: claude-codex`
+  marker. Migration: the first sync (or `agents sync`) removes the old managed
+  `ccp-*.md` cards and creates the new ones; unmarked files are never touched.
+  A model whose card name is taken by an unmarked file, or is reserved
+  (`general-purpose`, `explore`, `plan`, `statusline-setup`, `claude-code-guide`,
+  `claude-*`), is skipped with a warning. Restart Claude Code to see the new
+  names.
+- `claude-codex setup` installs the service, syncs the cards and adds
+  `ANTHROPIC_BASE_URL` to Claude Code's `settings.json` in one idempotent step
+  (`--dry-run`, `--undo`, `--force`). `scripts/install.sh` runs it after
+  installing.
+- The model list now follows the Codex CLI's `models_cache.json` while the
+  proxy runs, without a restart.
+- The proxy discovers Codex models itself: `serve` queries the Codex
+  `/models` endpoint with the Codex CLI login at startup and every
+  `CCP_MODEL_REFRESH_INTERVAL_SECS` (default 900; `0` = startup only), keeps the
+  result in its own `codex-models.json` (never in `~/.codex`) and keeps the last
+  good list on any failure. A change syncs the agent cards at once and is
+  logged. `CCP_MODEL_DISCOVERY=0` disables it; `claude-codex models --refresh`
+  forces it and `agents sync` refreshes first (not with `--dry-run`).
+- Agent card marker text is now `<!-- managed-by: claude-codex; do not edit -->`.
+  Cards with the previous Spanish text are still recognized and rewritten on the
+  next sync.
+- `scripts/install.sh` downloads from `CLAUDE_CODEX_REPO` (default
+  `josefl03/claude-codex`).
+- New README, `ARCHITECTURE.md`, `docs/`, contributing, security and conduct
+  files, and issue and pull request templates. The repository moves to
+  `josefl03/claude-codex`.
+
 ## v0.5.1 (2026-10-08)
 
 - Claude Haiku 5.5 (`claude-haiku-5-5`) is listed as a Claude model and maps to

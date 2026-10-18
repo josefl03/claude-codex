@@ -3,10 +3,10 @@ name = "claude-codex"
 version = "0.5.1"
 description = "Run Claude Code on your Claude and ChatGPT subscriptions at once, routed per model name"
 edition = "2024"
-authors = ["Claude Code Proxy contributors"]
+authors = ["Claude Code Proxy contributors", "José Fernández (josefl03)"]
 license = "MIT"
-repository = "https://github.com/fcakyon/claude-code-with-codex"
-homepage = "https://github.com/fcakyon/claude-code-with-codex"
+repository = "https://github.com/josefl03/claude-codex"
+homepage = "https://github.com/josefl03/claude-codex"
 readme = "README.md"
 keywords = ["claude-code", "codex", "openai", "anthropic", "gpt"]
 categories = ["command-line-utilities", "development-tools"]
@@ -14,7 +14,7 @@ categories = ["command-line-utilities", "development-tools"]
 [dependencies]
 clap = { version = "4.5", features = ["derive", "env"] }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["preserve_order"] }
 anyhow = "1.0"
 thiserror = "2.0"
 axum = { version = "0.8", features = ["macros", "multipart"] }

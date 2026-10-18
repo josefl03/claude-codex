@@ -1,7 +1,11 @@
+pub mod agent_cards;
 pub mod anthropic;
 pub mod auth;
 pub mod config;
+pub mod latest;
+pub mod lifecycle;
 pub mod logging;
+pub mod model_discovery;
 pub mod monitor;
 pub mod openai_compat;
 pub mod paths;
@@ -12,9 +16,12 @@ pub mod registry;
 pub mod request_identity;
 pub mod retry;
 pub mod server;
+pub mod service;
 pub mod session;
+pub mod setup;
 pub mod traffic;
 pub mod tui;
+pub mod uninstall;
 
 pub use crate::anthropic::error::{ErrorDetail, ErrorEnvelope, json_error};
 pub use crate::anthropic::schema::MessagesRequest;

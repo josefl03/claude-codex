@@ -1,21 +1,41 @@
 #!/usr/bin/env bash
 #
 # claude-codex installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/fcakyon/claude-code-with-codex/main/scripts/install.sh | bash
+# Usage: curl -fsSL https://raw.githubusercontent.com/josefl03/claude-codex/main/scripts/install.sh | bash
+#
+# Binaries are downloaded from the GitHub releases of ${CLAUDE_CODEX_REPO}. Until the first
+# release of that repository exists, install with:
+#   cargo install --git https://github.com/josefl03/claude-codex --locked && claude-codex setup
 #
 # Environment variables:
+#   CLAUDE_CODEX_REPO         - GitHub repository to download releases from, as owner/name
+#                               (default: josefl03/claude-codex)
 #   CLAUDE_CODEX_VERSION      - Pin a specific version (e.g., v0.1.0)
 #   CLAUDE_CODEX_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
+#   CLAUDE_CODEX_NO_SETUP     - Set to 1 to skip the automatic `claude-codex enable` after installing
+#   CLAUDE_CODEX_LOCAL_BINARY - Testing override: install this local binary instead of
+#                               downloading a release (no network, no checksum)
+#
+# After installing, the script runs `claude-codex enable` (autostart service, subagent
+# cards, Claude Code settings). If that fails the install still succeeds; rerun it with
+# `claude-codex enable`. Switch it off with `claude-codex disable`, or remove everything
+# (service, cards, settings, binary) with `claude-codex uninstall`.
 #
 # Examples:
 #   CLAUDE_CODEX_VERSION=v0.1.0 bash install.sh
 #   CLAUDE_CODEX_INSTALL_DIR=/opt/bin bash install.sh
+#   CLAUDE_CODEX_NO_SETUP=1 bash install.sh
+#   CLAUDE_CODEX_LOCAL_BINARY=target/debug/claude-codex CLAUDE_CODEX_INSTALL_DIR=/tmp/bin bash install.sh
 #
 
-set -e
+set -euo pipefail
+
+TMP_DIR=""
+INSTALL_DIR=""
+RELEASE_VERSION=""
 
 BIN_NAME="claude-codex"
-REPO="fcakyon/claude-code-with-codex"
+REPO="${CLAUDE_CODEX_REPO:-josefl03/claude-codex}"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -38,8 +58,8 @@ detect_platform() {
 		log_error "Unsupported operating system: $(uname -s)"
 		echo ""
 		echo "${BIN_NAME} supports macOS and Linux."
-		echo "For other platforms, build from source with Bun:"
-		echo "  git clone https://github.com/${REPO}"
+		echo "For other platforms, build from source with Rust:"
+		echo "  cargo install --git https://github.com/${REPO} --locked"
 		echo ""
 		exit 1
 		;;
@@ -52,8 +72,8 @@ detect_platform() {
 		log_error "Unsupported architecture: $(uname -m)"
 		echo ""
 		echo "${BIN_NAME} prebuilt binaries are available for amd64 and arm64."
-		echo "For other architectures, build from source with Bun:"
-		echo "  git clone https://github.com/${REPO}"
+		echo "For other architectures, build from source with Rust:"
+		echo "  cargo install --git https://github.com/${REPO} --locked"
 		echo ""
 		exit 1
 		;;
@@ -62,14 +82,9 @@ detect_platform() {
 	echo "${os}-${arch}"
 }
 
-install_from_release() {
-	log_info "Installing ${BIN_NAME} from GitHub releases..."
-
+fetch_release() {
 	local platform=$1
-	local tmp_dir
-	tmp_dir=$(mktemp -d)
-	trap 'rm -rf "$tmp_dir"' EXIT
-
+	local tmp_dir=$2
 	local version="${CLAUDE_CODEX_VERSION:-}"
 
 	if [ -z "$version" ]; then
@@ -86,7 +101,7 @@ install_from_release() {
 			exit 1
 		fi
 
-		version=$(echo "$release_json" | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/')
+		version=$(echo "$release_json" | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' || true)
 
 		if [ -z "$version" ]; then
 			log_error "Failed to fetch latest version"
@@ -166,6 +181,31 @@ install_from_release() {
 		exit 1
 	fi
 
+	RELEASE_VERSION="$version"
+}
+
+install_from_release() {
+	local platform=$1
+	TMP_DIR=$(mktemp -d)
+	trap 'rm -rf "${TMP_DIR:-}"' EXIT
+	local tmp_dir="$TMP_DIR"
+	local version
+
+	if [ -n "${CLAUDE_CODEX_LOCAL_BINARY:-}" ]; then
+		if [ ! -f "$CLAUDE_CODEX_LOCAL_BINARY" ]; then
+			log_error "CLAUDE_CODEX_LOCAL_BINARY does not exist: $CLAUDE_CODEX_LOCAL_BINARY"
+			exit 1
+		fi
+		log_info "Installing ${BIN_NAME} from local binary: $CLAUDE_CODEX_LOCAL_BINARY"
+		cp "$CLAUDE_CODEX_LOCAL_BINARY" "$tmp_dir/${BIN_NAME}"
+		version="local"
+		cd "$tmp_dir"
+	else
+		log_info "Installing ${BIN_NAME} from GitHub releases..."
+		fetch_release "$platform" "$tmp_dir"
+		version="$RELEASE_VERSION"
+	fi
+
 	local install_dir="${CLAUDE_CODEX_INSTALL_DIR:-}"
 	if [ -z "$install_dir" ]; then
 		if [[ -w /usr/local/bin ]]; then
@@ -175,6 +215,8 @@ install_from_release() {
 			mkdir -p "$install_dir"
 		fi
 	fi
+
+	mkdir -p "$install_dir" 2>/dev/null || true
 
 	if [ -f "$install_dir/${BIN_NAME}" ]; then
 		local existing_version
@@ -241,14 +283,42 @@ verify_installation() {
 	echo ""
 	"$install_dir/${BIN_NAME}" --version
 	echo ""
+}
 
-	echo "Get started:"
+print_manual_steps() {
+	echo "Finish the setup yourself:"
+	echo "  ${BIN_NAME} enable              # service, subagent cards, Claude Code settings"
 	echo "  codex login                     # sign in to ChatGPT with the Codex CLI"
 	echo "  ${BIN_NAME} codex auth status   # confirm the proxy sees that login"
-	echo "  ${BIN_NAME} serve               # start the proxy"
 	echo ""
 	echo "Documentation: https://github.com/${REPO}"
 	echo ""
+}
+
+run_setup() {
+	local install_dir="$1"
+
+	if [ "${CLAUDE_CODEX_NO_SETUP:-}" = "1" ]; then
+		log_info "Skipping setup (CLAUDE_CODEX_NO_SETUP=1)"
+		print_manual_steps
+		return 0
+	fi
+
+	log_info "Running ${BIN_NAME} enable..."
+	if "$install_dir/${BIN_NAME}" enable; then
+		log_success "Setup finished"
+		echo ""
+		echo "Switch it off any time with: ${BIN_NAME} disable (and back on with ${BIN_NAME} enable)"
+		echo "Remove everything with: ${BIN_NAME} uninstall"
+		echo "Documentation: https://github.com/${REPO}"
+		echo ""
+	else
+		log_warning "${BIN_NAME} is installed, but setup did not complete"
+		echo ""
+		echo "Fix the problem reported above and retry with:"
+		echo "  $install_dir/${BIN_NAME} enable"
+		echo ""
+	fi
 }
 
 main() {
@@ -264,6 +334,8 @@ main() {
 	install_from_release "$platform"
 
 	verify_installation "$INSTALL_DIR"
+
+	run_setup "$INSTALL_DIR"
 }
 
 main "$@"

@@ -50,7 +50,30 @@ enum Commands {
     Models {
         #[arg(long)]
         full: bool,
+        /// Fetch the model list from OpenAI now and show what changed
+        #[arg(long)]
+        refresh: bool,
     },
+    /// Manage Claude Code subagent cards for non-Claude models
+    Agents {
+        #[command(subcommand)]
+        command: claude_codex::agent_cards::AgentsCommand,
+    },
+    /// Manage the autostart service (systemd user unit / macOS LaunchAgent)
+    Service {
+        #[command(subcommand)]
+        command: claude_codex::service::ServiceCommand,
+    },
+    /// One-shot setup: service, agent cards and Claude Code settings
+    Setup(claude_codex::setup::SetupArgs),
+    /// Turn the proxy on: autostart service, agent cards and Claude Code settings
+    Enable(claude_codex::lifecycle::EnableArgs),
+    /// Turn the proxy off without uninstalling it (service, cards and settings entries)
+    Disable(claude_codex::lifecycle::DisableArgs),
+    /// Show whether the proxy is enabled, running and used by Claude Code
+    Status,
+    /// Remove everything `setup` and the installer put on this machine
+    Uninstall(claude_codex::uninstall::UninstallArgs),
     /// Manage Codex authentication
     Codex {
         #[command(subcommand)]
@@ -103,6 +126,11 @@ fn main() -> Result<()> {
             let bind_address = config::bind_address();
             let effective_port = port.unwrap_or_else(config::port);
             let registry = Registry::with_default_alias();
+            if std::io::stderr().is_terminal() && claude_codex::setup::never_ran() {
+                eprintln!(
+                    "Tip: run `claude-codex enable` once to install the autostart service and configure Claude Code."
+                );
+            }
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
@@ -119,6 +147,10 @@ fn main() -> Result<()> {
                 }
                 ServeMode::Monitor => {
                     let _stderr_guard = logging::suppress_stderr();
+                    let _agent_cards = {
+                        let _enter = runtime.enter();
+                        claude_codex::model_discovery::spawn_background_tasks()
+                    };
                     let monitor = MonitorHandle::default();
                     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
                     let (shutdown_complete_tx, shutdown_complete_rx) = std::sync::mpsc::channel();
@@ -182,10 +214,27 @@ fn main() -> Result<()> {
             tui::run_attached_monitor(|| monitor.snapshot(), url.to_string())?;
             Ok(())
         }
-        Commands::Models { full } => {
-            print_models(&Registry::with_default_alias(), full);
-            Ok(())
+        Commands::Models { full, refresh } => {
+            let refreshed = refresh.then(|| {
+                let result = claude_codex::model_discovery::refresh_cli();
+                claude_codex::model_discovery::print_refresh(&result);
+                result
+            });
+            let registry = Registry::with_default_alias();
+            print_models(&registry, full);
+            print_latest_aliases(&registry);
+            match refreshed {
+                Some(Err(err)) => Err(anyhow::anyhow!("model refresh failed: {err}")),
+                _ => Ok(()),
+            }
         }
+        Commands::Agents { command } => claude_codex::agent_cards::run_agents_command(command),
+        Commands::Service { command } => claude_codex::service::run_service_command(command),
+        Commands::Setup(args) => claude_codex::setup::run_setup(args),
+        Commands::Enable(args) => claude_codex::lifecycle::run_enable(args),
+        Commands::Disable(args) => claude_codex::lifecycle::run_disable(args),
+        Commands::Status => claude_codex::lifecycle::run_status(),
+        Commands::Uninstall(args) => claude_codex::uninstall::run_uninstall(args),
         Commands::Codex { command } => run_provider_cli("codex", command),
         Commands::Kimi { command } => run_provider_cli("kimi", command),
         Commands::Cursor { command } => run_provider_cli("cursor", command),
@@ -194,6 +243,7 @@ fn main() -> Result<()> {
 }
 
 async fn run_service(config: ServerConfig) -> Result<()> {
+    let _agent_cards = claude_codex::model_discovery::spawn_background_tasks();
     let mut signals = ServiceShutdownSignals::new()?;
     let (shutdown, stopped) = tokio::sync::oneshot::channel();
     let server = server::serve_with_shutdown(config, async {
@@ -334,6 +384,18 @@ fn print_models(registry: &Registry, full: bool) {
         } else {
             println!("{provider}: {}", compact_cursor_list(models));
         }
+    }
+}
+
+fn print_latest_aliases(registry: &Registry) {
+    let aliases = registry.latest_aliases();
+    if aliases.is_empty() {
+        return;
+    }
+    println!("latest aliases (resolved by the proxy on every request):");
+    let width = aliases.iter().map(|a| a.alias.len()).max().unwrap_or(0);
+    for alias in aliases {
+        println!("  {:<width$}  ->  {}", alias.alias, alias.target);
     }
 }
 

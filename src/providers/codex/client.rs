@@ -286,6 +286,53 @@ pub fn build_codex_transcription_headers(
     Ok(headers)
 }
 
+/// Headers for `GET /models`: same identity as the Responses requests, JSON
+/// accept, no body headers.
+pub fn build_codex_models_headers(auth: &StoredAuth) -> Result<http::HeaderMap, CodexError> {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::ACCEPT,
+        header_value("accept", "application/json")?,
+    );
+    headers.insert(
+        http::header::AUTHORIZATION,
+        header_value("authorization", &format!("Bearer {}", auth.access))?,
+    );
+    headers.insert(
+        "originator",
+        header_value("originator", &config::codex_originator(ORIGINATOR))?,
+    );
+    if let Some(account_id) = auth.account_id.as_deref() {
+        headers.insert(
+            "ChatGPT-Account-Id",
+            header_value("ChatGPT-Account-Id", account_id)?,
+        );
+    }
+    let user_agent = config::codex_user_agent(&default_user_agent(false));
+    if !user_agent.is_empty() {
+        headers.insert(
+            http::header::USER_AGENT,
+            header_value("user-agent", &user_agent)?,
+        );
+    }
+    Ok(headers)
+}
+
+/// `<codex api root>/models?client_version=<v>`, derived from the Responses
+/// base URL the same way [`search_endpoint`] is.
+pub(crate) fn models_endpoint(base_url: &str, client_version: &str) -> String {
+    let base_url = base_url.trim_end_matches('/');
+    let root = base_url.strip_suffix("/responses").unwrap_or(base_url);
+    let mut url = format!("{root}/models");
+    if let Ok(mut parsed) = url::Url::parse(&url) {
+        parsed
+            .query_pairs_mut()
+            .append_pair("client_version", client_version);
+        url = parsed.into();
+    }
+    url
+}
+
 fn header_value(name: &str, value: &str) -> Result<http::HeaderValue, CodexError> {
     http::HeaderValue::from_str(value).map_err(|e| CodexError {
         status: 500,
@@ -773,6 +820,56 @@ impl CodexHttpClient {
 
     pub fn body_idle_timeout_ms(&self) -> u64 {
         self.body_idle_timeout_ms
+    }
+
+    /// Fetch the account's model catalog (`GET /models?client_version=`),
+    /// refreshing the OAuth token once on a 401. Returns the raw response so
+    /// the caller decides what a status code means.
+    pub(crate) async fn get_models(
+        &self,
+        client_version: &str,
+        timeout: Duration,
+    ) -> Result<reqwest::Response, CodexError> {
+        let url = models_endpoint(&self.base_url, client_version);
+        let mut auth = self
+            .auth_manager
+            .get_auth()
+            .await
+            .map_err(|error| CodexError {
+                status: 401,
+                message: "Auth error".to_string(),
+                detail: Some(error.to_string()),
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Auth,
+            })?;
+        let mut refresh_attempted = false;
+        loop {
+            let headers = build_codex_models_headers(&auth)?;
+            let mut request = self.client.get(&url).timeout(timeout);
+            for (key, value) in &headers {
+                request = request.header(key.as_str(), value.as_bytes());
+            }
+            let response = request.send().await.map_err(|error| CodexError {
+                status: 0,
+                message: "Codex models request failed".to_string(),
+                detail: Some(error.without_url().to_string()),
+                retry_after: None,
+                usage_limit: None,
+                origin: CodexErrorOrigin::Http,
+            })?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED && !refresh_attempted {
+                refresh_attempted = true;
+                drop(response);
+                auth = self
+                    .auth_manager
+                    .force_refresh(&auth.access)
+                    .await
+                    .map_err(auth_refresh_error)?;
+                continue;
+            }
+            return Ok(response);
+        }
     }
 
     pub(crate) async fn post_transcription(

@@ -1,4 +1,7 @@
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 use once_cell::sync::Lazy;
 use serde_json::Value;
@@ -24,39 +27,118 @@ const BUNDLED_MODELS: &[&str] = &[
     "gpt-6.1-sol",
 ];
 
+/// Cached parse of `models_cache.json`, keyed by path, mtime and size so a
+/// rewrite by the Codex CLI is picked up without restarting the proxy.
+#[derive(Default)]
+struct CatalogCache {
+    stamp: Option<(PathBuf, SystemTime, u64)>,
+    models: Vec<String>,
+}
+
+static CLI_CACHE: Lazy<Mutex<CatalogCache>> = Lazy::new(Mutex::default);
+/// Same shape for the proxy's own `codex-models.json`, written by
+/// `model_discovery` after fetching the catalog itself.
+static OWN_CACHE: Lazy<Mutex<CatalogCache>> = Lazy::new(Mutex::default);
+
+/// Whether a catalog entry is usable through this proxy: listed in the model
+/// picker and callable through the API. The endpoint and the Codex CLI cache
+/// share this shape (`ModelsResponse`), so one rule serves both.
+pub fn is_listed_api_model(entry: &Value) -> bool {
+    entry["visibility"] == "list" && entry["supported_in_api"] == true
+}
+
+/// Listed, API-capable slugs in the cache file at `path`. Re-reads only when
+/// the file changed since the last call; empty when it is missing or invalid.
+fn load_cli_models(cache: &Mutex<CatalogCache>, path: &Path) -> Vec<String> {
+    let mut cache = cache.lock().unwrap_or_else(|e| e.into_inner());
+    let stamp = std::fs::metadata(path)
+        .ok()
+        .and_then(|meta| Some((path.to_path_buf(), meta.modified().ok()?, meta.len())));
+    if stamp.is_some() && stamp == cache.stamp {
+        return cache.models.clone();
+    }
+    let parsed = stamp
+        .as_ref()
+        .and_then(|_| std::fs::read(path).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+    match (&stamp, parsed) {
+        (_, Some(cache_file)) => {
+            cache.models = cache_file["models"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|m| is_listed_api_model(m))
+                .filter_map(|m| m["slug"].as_str().map(str::to_string))
+                .collect();
+        }
+        // Missing file: no catalog. Unreadable or half-written file: keep the
+        // last good catalog rather than dropping models (and their agent cards).
+        (None, None) => cache.models.clear(),
+        (Some(_), None) => {}
+    }
+    cache.stamp = stamp;
+    cache.models.clone()
+}
+
 /// Listed, API-capable slugs the Codex CLI last fetched for this account into
 /// `models_cache.json` next to `auth.json`. Empty without a cache, and in unit
 /// tests so they never depend on the developer's account.
-static CLI_MODELS: Lazy<Vec<String>> = Lazy::new(|| {
+fn cli_models() -> Vec<String> {
     if cfg!(test) {
         return Vec::new();
     }
-    std::fs::read(codex_auth_file().with_file_name("models_cache.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .as_ref()
-        .and_then(|cache| cache["models"].as_array())
-        .into_iter()
-        .flatten()
-        .filter(|m| m["visibility"] == "list" && m["supported_in_api"] == true)
-        .filter_map(|m| m["slug"].as_str().map(str::to_string))
-        .collect()
-});
+    load_cli_models(
+        &CLI_CACHE,
+        &codex_auth_file().with_file_name("models_cache.json"),
+    )
+}
 
-/// Models the Codex backend accepts: the bundled list plus the account's CLI
-/// catalog, so a model the account gains is usable without a release.
-pub static ALLOWED_MODELS: Lazy<Vec<String>> = Lazy::new(|| {
-    let mut models: Vec<String> = BUNDLED_MODELS.iter().map(|m| m.to_string()).collect();
-    models.extend(CLI_MODELS.iter().cloned());
+/// Path of the proxy's own catalog cache (`codex-models.json` in the state
+/// directory). Never the Codex CLI's `models_cache.json`.
+pub fn own_cache_file() -> PathBuf {
+    crate::paths::state_dir().join("codex-models.json")
+}
+
+/// Listed, API-capable slugs the proxy itself last fetched. Empty in unit
+/// tests so they never read the developer's state directory.
+fn own_models() -> Vec<String> {
+    if cfg!(test) {
+        return Vec::new();
+    }
+    load_cli_models(&OWN_CACHE, &own_cache_file())
+}
+
+/// Forget the cached parse of the proxy's own cache so the next read goes to
+/// disk even if a rewrite landed inside one mtime tick.
+pub fn invalidate_own_cache() {
+    OWN_CACHE.lock().unwrap_or_else(|e| e.into_inner()).stamp = None;
+}
+
+/// Slugs the account's catalogs list: the Codex CLI's cache plus the proxy's
+/// own fetched one.
+fn catalog_models() -> Vec<String> {
+    let mut models = cli_models();
+    models.extend(own_models());
     models.sort_unstable();
     models.dedup();
     models
-});
+}
+
+/// Models the Codex backend accepts: the bundled list plus the account's
+/// catalogs (the proxy's own and the Codex CLI's), so a model the account
+/// gains is usable without a release or a restart.
+pub fn allowed_models() -> Vec<String> {
+    let mut models: Vec<String> = BUNDLED_MODELS.iter().map(|m| m.to_string()).collect();
+    models.extend(catalog_models());
+    models.sort_unstable();
+    models.dedup();
+    models
+}
 
 /// Every accepted model plus its `-fast` priority alias, as listed to clients.
 pub fn listed_models() -> Vec<String> {
-    let mut models: Vec<String> = ALLOWED_MODELS
-        .iter()
+    let mut models: Vec<String> = allowed_models()
+        .into_iter()
         .flat_map(|m| [m.clone(), format!("{m}-fast")])
         .collect();
     models.sort_unstable();
@@ -91,7 +173,7 @@ pub const MODEL_ALIASES: &[(&str, &[&str])] = &[
 
 /// Resolve a Claude-style alias to the preferred model the account has.
 pub fn alias_target(model: &str) -> Option<&'static str> {
-    alias_target_in(model, &CLI_MODELS)
+    alias_target_in(model, &catalog_models())
 }
 
 fn alias_target_in(model: &str, catalog: &[String]) -> Option<&'static str> {
@@ -101,6 +183,12 @@ fn alias_target_in(model: &str, catalog: &[String]) -> Option<&'static str> {
             .iter()
             .copied()
             .find(|target| catalog.iter().any(|m| m == target))
+            .or_else(|| {
+                targets
+                    .iter()
+                    .copied()
+                    .find(|target| BUNDLED_MODELS.contains(target))
+            })
             .unwrap_or(targets[0]),
     )
 }
@@ -112,7 +200,10 @@ pub struct ResolvedModel {
 }
 
 fn fast_model_aliases() -> HashSet<String> {
-    ALLOWED_MODELS.iter().map(|m| format!("{m}-fast")).collect()
+    allowed_models()
+        .iter()
+        .map(|m| format!("{m}-fast"))
+        .collect()
 }
 
 fn resolve_fast_model_alias(model: &str) -> ResolvedModel {
@@ -177,7 +268,7 @@ impl std::fmt::Display for ModelNotAllowedError {
 }
 
 pub fn assert_allowed_model(model: &str) -> Result<(), ModelNotAllowedError> {
-    if ALLOWED_MODELS.iter().any(|m| m == model) {
+    if allowed_models().iter().any(|m| m == model) {
         Ok(())
     } else {
         Err(ModelNotAllowedError {
@@ -214,7 +305,7 @@ pub fn full_lane_web_search_model(model: &str) -> &str {
 }
 
 pub fn is_valid_model_for_codex(model: &str) -> bool {
-    if ALLOWED_MODELS.iter().any(|m| m == model) {
+    if allowed_models().iter().any(|m| m == model) {
         return true;
     }
     let fast_set = fast_model_aliases();
@@ -322,8 +413,8 @@ mod tests {
     #[test]
     fn listed_models_pair_every_model_with_fast() {
         let listed = listed_models();
-        for model in ALLOWED_MODELS.iter() {
-            assert!(listed.contains(model));
+        for model in allowed_models() {
+            assert!(listed.contains(&model));
             assert!(listed.contains(&format!("{model}-fast")));
         }
     }
@@ -348,5 +439,33 @@ mod tests {
     #[test]
     fn not_allowed_rejected() {
         assert!(assert_allowed_model("not-a-model").is_err());
+    }
+
+    #[test]
+    fn cli_catalog_reloads_when_the_cache_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("models_cache.json");
+        let cache = Mutex::default();
+        assert!(load_cli_models(&cache, &path).is_empty());
+
+        let entry = |slug: &str, visibility: &str| serde_json::json!({"slug": slug, "visibility": visibility, "supported_in_api": true});
+        let write = |models: Vec<Value>| {
+            std::fs::write(&path, serde_json::json!({ "models": models }).to_string()).unwrap();
+        };
+        write(vec![
+            entry("gpt-9-a", "list"),
+            entry("gpt-9-hidden", "hide"),
+        ]);
+        assert_eq!(load_cli_models(&cache, &path), vec!["gpt-9-a"]);
+
+        // Same-size rewrite still has to be seen once the mtime moves.
+        write(vec![entry("gpt-9-a", "list"), entry("gpt-9-b", "list")]);
+        assert_eq!(load_cli_models(&cache, &path), vec!["gpt-9-a", "gpt-9-b"]);
+
+        write(vec![entry("gpt-9-b", "list")]);
+        assert_eq!(load_cli_models(&cache, &path), vec!["gpt-9-b"]);
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(load_cli_models(&cache, &path).is_empty());
     }
 }

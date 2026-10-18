@@ -373,6 +373,18 @@ async fn handler_models(
             })
         })
         .collect();
+    // `-latest` aliases come last; they resolve to the target at request time.
+    data.extend(state.registry.latest_aliases().into_iter().map(|alias| {
+        json!({
+            "type": "model",
+            "object": "model",
+            "id": alias.alias,
+            "display_name": format!(
+                "{} (alias of {}, {})",
+                alias.alias, alias.target, alias.provider
+            ),
+        })
+    }));
     let has_more = query.limit.is_some_and(|limit| data.len() > limit);
     if let Some(limit) = query.limit {
         data.truncate(limit);
@@ -1598,6 +1610,28 @@ async fn dispatch_request(
     };
 
     let mut normalized_model = normalize_incoming_model(model);
+    // `<family>-latest` aliases are resolved here, before routing, so everything
+    // downstream (routing, session, logs, the upstream request) sees the real id.
+    let mut alias_error = None;
+    match state.registry.resolve_latest(&normalized_model) {
+        crate::latest::Resolution::NotAlias => {}
+        crate::latest::Resolution::Resolved(alias) => {
+            log.info(
+                "latest alias resolved",
+                Some(Map::from_iter([
+                    ("reqId".to_string(), json!(&req_id)),
+                    ("alias".to_string(), json!(&alias.alias)),
+                    ("model".to_string(), json!(&alias.target)),
+                    ("provider".to_string(), json!(&alias.provider)),
+                    ("countTokens".to_string(), json!(count_tokens)),
+                ])),
+            );
+            normalized_model = alias.target;
+        }
+        crate::latest::Resolution::NoCandidates { alias } => {
+            alias_error = Some(state.registry.no_latest_candidates_message(&alias));
+        }
+    }
     body.model = Some(normalized_model.clone());
     let session_state = if let Some(session_id) = session_id.as_deref() {
         session::existing_session(Some(session_id), now)
@@ -1607,9 +1641,13 @@ async fn dispatch_request(
     let session_affinity = session_state
         .as_ref()
         .and_then(|state| state.affinity_provider.as_ref());
-    let original_provider = state
-        .registry
-        .provider_for_model(&normalized_model, session_affinity);
+    let original_provider = if alias_error.is_some() {
+        None
+    } else {
+        state
+            .registry
+            .provider_for_model(&normalized_model, session_affinity)
+    };
     let configured_auto_review_model = crate::config::auto_review_model();
     let auto_review_route = original_provider.as_ref().and_then(|provider| {
         apply_auto_review_model(
@@ -1643,10 +1681,12 @@ async fn dispatch_request(
             let response = json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
-                format!(
-                    "Unknown model \"{normalized_model}\". {}",
-                    state.registry.unknown_model_message()
-                ),
+                alias_error.unwrap_or_else(|| {
+                    format!(
+                        "Unknown model \"{normalized_model}\". {}",
+                        state.registry.unknown_model_message()
+                    )
+                }),
             );
             log_request_completed(
                 &log,

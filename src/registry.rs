@@ -7,7 +7,7 @@ use anyhow::{Result, anyhow};
 use async_trait::async_trait;
 use axum::{http::StatusCode, response::Response};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 pub const ANTHROPIC_STYLE_ALIASES: &[&str] = &[
     "haiku",
@@ -47,7 +47,9 @@ pub(crate) const GROK_MODELS: &[&str] =
 
 pub struct Registry {
     alias_provider: AliasProvider,
-    models: BTreeMap<String, Vec<String>>,
+    models: RwLock<BTreeMap<String, Vec<String>>>,
+    /// Whether `refresh` may rebuild the model lists (false for injected providers).
+    dynamic: bool,
     handlers: BTreeMap<String, Arc<dyn Provider>>,
 }
 
@@ -92,7 +94,8 @@ impl Registry {
 
         Self {
             alias_provider,
-            models,
+            models: RwLock::new(models),
+            dynamic: true,
             handlers,
         }
     }
@@ -114,9 +117,26 @@ impl Registry {
         }
         Self {
             alias_provider,
-            models,
+            models: RwLock::new(models),
+            dynamic: false,
             handlers,
         }
+    }
+
+    /// Re-read the model lists that can change while the proxy runs (the
+    /// proxy's own `codex-models.json` and the Codex CLI's `models_cache.json`).
+    /// Returns whether anything changed.
+    pub fn refresh(&self) -> bool {
+        if !self.dynamic {
+            return false;
+        }
+        let codex = crate::providers::codex::translate::model_allowlist::listed_models();
+        let mut models = self.models.write().unwrap_or_else(|e| e.into_inner());
+        if models.get("codex") == Some(&codex) {
+            return false;
+        }
+        models.insert("codex".into(), codex);
+        true
     }
 
     pub fn list_provider_names(&self) -> Vec<String> {
@@ -130,7 +150,13 @@ impl Registry {
     }
 
     pub fn supported_models_for(&self, provider: &str) -> Vec<String> {
-        let mut models = self.models.get(provider).cloned().unwrap_or_default();
+        let mut models = self
+            .models
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(provider)
+            .cloned()
+            .unwrap_or_default();
         if provider == self.alias_provider.as_str() {
             for alias in ANTHROPIC_STYLE_ALIASES {
                 if !models.iter().any(|value| value == alias) {
@@ -143,6 +169,7 @@ impl Registry {
     }
 
     pub fn all_supported_models(&self) -> Vec<(String, String)> {
+        self.refresh();
         let mut out = Vec::new();
         for provider in self.handlers.keys() {
             for model in self.supported_models_for(provider) {
@@ -153,11 +180,43 @@ impl Registry {
     }
 
     pub fn grouped_models(&self) -> BTreeMap<String, Vec<String>> {
+        self.refresh();
         let mut out = BTreeMap::new();
         for provider in self.handlers.keys() {
             out.insert(provider.clone(), self.supported_models_for(provider));
         }
         out
+    }
+
+    /// `(id, provider)` pairs the `-latest` aliases are computed from: the real
+    /// Codex model table, without the Anthropic-style aliases.
+    fn latest_candidates(&self) -> Vec<(String, String)> {
+        let table = self.models.read().unwrap_or_else(|e| e.into_inner());
+        table
+            .iter()
+            .filter(|(name, _)| name.as_str() == "codex")
+            .flat_map(|(name, models)| models.iter().map(|m| (m.clone(), name.clone())))
+            .collect()
+    }
+
+    /// Every `<family>-latest` / `<family>-<tier>-latest` alias that currently
+    /// has a target, sorted by alias. Empty when `CCP_LATEST_ALIASES=0`.
+    pub fn latest_aliases(&self) -> Vec<crate::latest::LatestAlias> {
+        if !crate::latest::enabled() {
+            return Vec::new();
+        }
+        self.refresh();
+        crate::latest::compute(&self.latest_candidates())
+    }
+
+    /// Resolve a requested id that may be a `-latest` alias. Call it before
+    /// `provider_for_model` and use the target id from then on.
+    pub fn resolve_latest(&self, requested: &str) -> crate::latest::Resolution {
+        if !crate::latest::enabled() || crate::latest::parse_alias(requested).is_none() {
+            return crate::latest::Resolution::NotAlias;
+        }
+        self.refresh();
+        crate::latest::resolve(&self.latest_candidates(), requested)
     }
 
     pub fn provider_for_model(
@@ -182,16 +241,31 @@ impl Registry {
         // Exact model-name match reaches a specific backend regardless of the alias
         // target: this is how `ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra` sends the
         // sonnet slot to codex even while aliases default to the Anthropic passthrough.
-        for (name, models) in &self.models {
-            if name == "anthropic" {
-                continue;
-            }
-            if models.iter().any(|candidate| candidate == &normalized) {
-                return self.handlers.get(name).cloned();
-            }
-        }
+        self.provider_in_table(&normalized).or_else(|| {
+            // A model the Codex CLI catalog gained since startup.
+            self.refresh()
+                .then(|| self.provider_in_table(&normalized))?
+        })
+    }
 
-        None
+    fn provider_in_table(&self, normalized: &str) -> Option<Arc<dyn Provider>> {
+        let table = self.models.read().unwrap_or_else(|e| e.into_inner());
+        table
+            .iter()
+            .filter(|(name, _)| name.as_str() != "anthropic")
+            .find(|(_, models)| models.iter().any(|candidate| candidate == normalized))
+            .and_then(|(name, _)| self.handlers.get(name).cloned())
+    }
+
+    /// Message for an alias with no model behind it (a 400 for the client).
+    pub fn no_latest_candidates_message(&self, alias: &str) -> String {
+        let available: Vec<String> = self.latest_aliases().into_iter().map(|a| a.alias).collect();
+        let list = if available.is_empty() {
+            "none right now".to_string()
+        } else {
+            available.join(", ")
+        };
+        format!("No model matches the alias \"{alias}\". Available latest aliases: {list}.")
     }
 
     pub fn unknown_model_message(&self) -> String {
@@ -332,6 +406,40 @@ fn build_cursor_models() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::latest::Resolution;
+
+    #[test]
+    fn latest_aliases_resolve_against_the_bundled_list() {
+        let registry = Registry::new(AliasProvider::Anthropic);
+        let aliases = registry.latest_aliases();
+        assert!(aliases.iter().any(|a| a.alias == "gpt-sol-latest"));
+        assert!(
+            aliases
+                .iter()
+                .all(|a| a.provider == "codex" && a.family == "gpt")
+        );
+        assert_eq!(registry.resolve_latest("grok-latest"), Resolution::NotAlias);
+        // No alias collides with a real id, and Claude ids never get one.
+        let real: Vec<String> = registry
+            .all_supported_models()
+            .into_iter()
+            .map(|(m, _)| m)
+            .collect();
+        assert!(aliases.iter().all(|a| !real.contains(&a.alias)));
+        assert!(aliases.iter().all(|a| !a.alias.starts_with("claude")));
+        match registry.resolve_latest("gpt-sol-latest") {
+            Resolution::Resolved(a) => assert_eq!(a.provider, "codex"),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(registry.resolve_latest("opus"), Resolution::NotAlias);
+        assert_eq!(registry.resolve_latest("gpt-6-sol"), Resolution::NotAlias);
+        assert!(matches!(
+            registry.resolve_latest("gpt-nova-latest"),
+            Resolution::NoCandidates { .. }
+        ));
+        let message = registry.no_latest_candidates_message("gpt-nova-latest");
+        assert!(message.contains("gpt-nova-latest") && message.contains("gpt-sol-latest"));
+    }
 
     #[test]
     fn normalize_model_trims_hint() {

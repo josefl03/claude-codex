@@ -7,7 +7,7 @@
 set -euo pipefail
 
 tag="$1"
-repo="${GITHUB_REPOSITORY:-fcakyon/claude-code-with-codex}"
+repo="${GITHUB_REPOSITORY:-josefl03/claude-codex}"
 upstream_owner="raine"
 compare="$(gh api "repos/$repo/releases/generate-notes" -f tag_name="$tag" --jq .body \
   | grep -o "https://github.com/$repo/compare/[^ ]*")"
