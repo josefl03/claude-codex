@@ -189,10 +189,19 @@ impl Sandbox {
     }
 }
 
-struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+/// The environment is process-global and cargo runs tests in parallel, so every
+/// test that points the proxy at its own sandbox must hold this lock for its
+/// whole lifetime; otherwise one test's variables leak into another's.
+static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+struct EnvGuard(
+    Vec<(&'static str, Option<std::ffi::OsString>)>,
+    #[allow(dead_code)] tokio::sync::MutexGuard<'static, ()>,
+);
 
 impl EnvGuard {
-    fn set(vars: Vec<(&'static str, String)>) -> Self {
+    async fn set(vars: Vec<(&'static str, String)>) -> Self {
+        let lock = ENV_LOCK.lock().await;
         let saved = vars
             .iter()
             .map(|(k, _)| (*k, std::env::var_os(k)))
@@ -200,7 +209,7 @@ impl EnvGuard {
         for (key, value) in vars {
             unsafe { std::env::set_var(key, value) };
         }
-        Self(saved)
+        Self(saved, lock)
     }
 }
 
@@ -395,7 +404,7 @@ async fn a_running_registry_routes_lists_and_aliases_a_new_model_without_restart
 
     let sb = Sandbox::new();
     let mock = Mock::start(catalog(&[("gpt-9-sol", "list", true)]));
-    let _env = EnvGuard::set(sb.envs(&mock));
+    let _env = EnvGuard::set(sb.envs(&mock)).await;
 
     let registry = Arc::new(Registry::with_default_alias());
     assert!(
@@ -465,7 +474,7 @@ async fn aliases_resolve_to_discovered_targets() {
         ("gpt-6.1-sol", "list", true),
         ("gpt-6-luna", "list", true),
     ]));
-    let _env = EnvGuard::set(sb.envs(&mock));
+    let _env = EnvGuard::set(sb.envs(&mock)).await;
     claude_codex::model_discovery::refresh_codex()
         .await
         .unwrap();
@@ -482,7 +491,7 @@ async fn startup_pass_refreshes_before_syncing_cards_and_stops_when_interval_is_
         ("CCP_MODEL_REFRESH_INTERVAL_SECS", "0".to_string()),
         ("CCP_AGENT_SYNC_INTERVAL_SECS", "0".to_string()),
     ]);
-    let _env = EnvGuard::set(vars);
+    let _env = EnvGuard::set(vars).await;
     let task = claude_codex::model_discovery::spawn_background_tasks().expect("enabled");
     for _ in 0..200 {
         if task.is_finished() {
@@ -513,7 +522,7 @@ async fn discovery_can_be_switched_off() {
         ("CCP_MODEL_REFRESH_INTERVAL_SECS", "0".to_string()),
         ("CCP_AGENT_SYNC_INTERVAL_SECS", "0".to_string()),
     ]);
-    let _env = EnvGuard::set(vars);
+    let _env = EnvGuard::set(vars).await;
     let task = claude_codex::model_discovery::spawn_background_tasks().expect("cards still on");
     for _ in 0..200 {
         if task.is_finished() {
@@ -542,7 +551,7 @@ async fn a_new_model_takes_over_the_latest_alias_without_a_restart() {
     use claude_codex::latest::Resolution;
     let sb = Sandbox::new();
     let mock = Mock::start(catalog(&[("gpt-6.1-sol", "list", true)]));
-    let _env = EnvGuard::set(sb.envs(&mock));
+    let _env = EnvGuard::set(sb.envs(&mock)).await;
     let registry = Registry::with_default_alias();
     let target = |registry: &Registry, alias: &str| match registry.resolve_latest(alias) {
         Resolution::Resolved(a) => a.target,

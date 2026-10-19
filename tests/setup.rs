@@ -17,15 +17,38 @@ struct Sandbox {
 
 impl Sandbox {
     fn new() -> Self {
-        let port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        // Tests run in parallel and a port is released before the test binds it
+        // again, so never hand the same port to two sandboxes of this process.
+        static USED: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+        let port = loop {
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let mut used = USED.lock().unwrap_or_else(|e| e.into_inner());
+            if !used.contains(&port) {
+                used.push(port);
+                break port;
+            }
+        };
         Self {
             root: tempfile::tempdir().unwrap(),
             port,
         }
+    }
+    /// A sandbox whose port is already bound by the returned listener, so no
+    /// parallel test can grab it between choosing and binding.
+    fn with_listener() -> (Self, std::net::TcpListener) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        (
+            Self {
+                root: tempfile::tempdir().unwrap(),
+                port,
+            },
+            listener,
+        )
     }
     fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
@@ -732,8 +755,7 @@ fn a_failing_step_does_not_stop_the_others_and_sets_the_exit_code() {
 
 #[test]
 fn a_manual_server_on_the_port_is_reported_not_stopped() {
-    let sb = Sandbox::new();
-    let listener = std::net::TcpListener::bind(("127.0.0.1", sb.port)).unwrap();
+    let (sb, listener) = Sandbox::with_listener();
     let (ok, out) = uninstall(&sb, &[]);
     assert!(ok, "{out}");
     assert!(out.contains("still listening"), "{out}");
@@ -1023,9 +1045,8 @@ fn dry_run_of_enable_and_disable_has_no_effects() {
 
 #[test]
 fn disable_warns_about_a_manual_server_and_does_not_stop_it() {
-    let sb = Sandbox::new();
+    let (sb, listener) = Sandbox::with_listener();
     assert!(sb.run(&["enable"]).0);
-    let listener = std::net::TcpListener::bind(("127.0.0.1", sb.port)).unwrap();
     let (ok, out) = sb.run(&["disable"]);
     assert!(ok, "{out}");
     assert!(out.contains("still listening"), "{out}");
