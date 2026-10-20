@@ -30,7 +30,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Cargo.toml and Cargo.lock agree on the version
         run: |
-          toml="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          toml="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)"
           lock="$(awk '/^name = "claude-codex"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
           echo "Cargo.toml: $toml, Cargo.lock: $lock"
           test -n "$toml" && test "$toml" = "$lock"
