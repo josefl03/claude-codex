@@ -1,148 +1,208 @@
 name: Release
 
+# Builds the four prebuilt binaries scripts/install.sh downloads and publishes
+# them as a GitHub Release. It never runs from a tag push (tags created with
+# GITHUB_TOKEN would not start it anyway): auto-release.yml starts it with
+# `gh workflow run`, or run it by hand from the Actions tab. The release itself
+# creates the tag at the exact commit that was built. See docs/releasing.md.
+
 on:
-  push:
-    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to publish, vX.Y.Z (must match the version in Cargo.toml)"
+        required: true
+        type: string
+      sha:
+        description: "Commit to build (default: the commit of the selected branch)"
+        required: false
+        type: string
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
+      sha:
+        required: false
+        type: string
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag }}
+  cancel-in-progress: false
 
 env:
   BIN_NAME: claude-codex
 
 jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+      - name: Validate tag, version and existing release
+        id: meta
+        env:
+          TAG: ${{ inputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::tag '$TAG' is not vX.Y.Z"; exit 1; }
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          [ "v$version" = "$TAG" ] || { echo "::error::Cargo.toml says $version but the tag is $TAG"; exit 1; }
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::release $TAG already exists; delete it first to rebuild"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error::tag $TAG already exists without a release; delete the tag first"
+            exit 1
+          fi
+          scripts/check-release-assets.sh
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   checks:
+    needs: prepare
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - name: Test
         run: cargo test --locked -- --test-threads=1
 
   build:
-    needs: checks
+    needs: [prepare, checks]
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
-            target: aarch64-apple-darwin
-            platform: darwin-arm64
-            ext: ""
-            archive: tar.gz
+          # Linux is built against musl: a fully static binary that runs on any
+          # distribution (a glibc build would need the glibc of its build host).
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-amd64
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            platform: linux-arm64
           - os: macos-15-intel
             target: x86_64-apple-darwin
             platform: darwin-amd64
-            ext: ""
-            archive: tar.gz
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            platform: linux-amd64
-            ext: ""
-            archive: tar.gz
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            platform: linux-arm64
-            ext: ""
-            archive: tar.gz
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            platform: windows-amd64
-            ext: .exe
-            archive: zip
-          - os: windows-11-arm
-            target: aarch64-pc-windows-msvc
-            platform: windows-arm64
-            ext: .exe
-            archive: zip
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-arm64
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
       - name: Build
-        run: |
-          cargo build --release --locked --target ${{ matrix.target }}
-      - name: Verify Unix binary
-        if: runner.os != 'Windows'
         env:
-          VERSION: ${{ github.ref_name }}
-        run: |
-          expected="claude-codex ${VERSION#v}"
-          actual="$(target/${{ matrix.target }}/release/${BIN_NAME} --version)"
-          test "$actual" = "$expected"
-      - name: Verify Windows binary
-        if: runner.os == 'Windows'
-        shell: pwsh
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Verify binary version
         env:
-          VERSION: ${{ github.ref_name }}
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          $expected = "claude-codex $($env:VERSION.TrimStart('v'))"
-          $actual = & "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" --version
-          if ($actual -ne $expected) {
-            Write-Error "expected '$expected', got '$actual'"
-          }
-      - name: Package Unix
-        if: runner.os != 'Windows'
+          bin="target/${{ matrix.target }}/release/${BIN_NAME}"
+          test "$("$bin" --version)" = "claude-codex ${TAG#v}"
+          test "$("$bin" version)" = "claude-codex ${TAG#v}"
+      - name: Verify Linux binary is portable
+        if: runner.os == 'Linux'
+        run: |
+          bin="target/${{ matrix.target }}/release/${BIN_NAME}"
+          file "$bin"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked'
+          if ldd "$bin" 2>&1 | grep -q 'libc.so\|=>'; then
+            echo "::error::binary links shared libraries"
+            ldd "$bin" || true
+            exit 1
+          fi
+      - name: Verify macOS binary
+        if: runner.os == 'macOS'
+        run: |
+          bin="target/${{ matrix.target }}/release/${BIN_NAME}"
+          file "$bin"
+          otool -L "$bin"
+      - name: Package
         run: |
           mkdir -p dist
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "dist/${BIN_NAME}"
-          archive="${BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
-          tar -C dist -czf "$archive" "${BIN_NAME}"
-          shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256"
-      - name: Package Windows
-        if: runner.os == 'Windows'
-        shell: pwsh
+          archive="${BIN_NAME}-${{ matrix.platform }}.tar.gz"
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/$archive" "${BIN_NAME}"
+          (cd dist && shasum -a 256 "$archive" > "${BIN_NAME}-${{ matrix.platform }}.sha256")
+          (cd dist && shasum -a 256 -c "${BIN_NAME}-${{ matrix.platform }}.sha256")
+      - name: Test the archive as the installer would unpack it
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/${env:BIN_NAME}.exe" "dist/${env:BIN_NAME}.exe"
-          $archive = "${env:BIN_NAME}-${{ matrix.platform }}.${{ matrix.archive }}"
-          Compress-Archive -Path "dist/${env:BIN_NAME}.exe" -DestinationPath $archive -Force
-          $hash = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLower()
-          "$hash  $archive" | Out-File -FilePath "${env:BIN_NAME}-${{ matrix.platform }}.sha256" -Encoding ascii
+          out="$(mktemp -d)"
+          tar -xzf "dist/${BIN_NAME}-${{ matrix.platform }}.tar.gz" -C "$out"
+          test "$("$out/${BIN_NAME}" --version)" = "claude-codex ${TAG#v}"
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/${{ env.BIN_NAME }}-${{ matrix.platform }}.tar.gz
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.platform }}
-          path: |
-            ${{ env.BIN_NAME }}-${{ matrix.platform }}.${{ matrix.archive }}
-            ${{ env.BIN_NAME }}-${{ matrix.platform }}.sha256
-
-  smoke-windows:
-    needs: build
-    runs-on: windows-latest
-    steps:
-      - uses: actions/download-artifact@v5
-        with:
-          name: windows-amd64
-      - shell: pwsh
-        run: |
-          Expand-Archive claude-codex-windows-amd64.zip -DestinationPath .
-          .\claude-codex.exe --version
+          path: dist/*
+          if-no-files-found: error
 
   release:
-    needs: [build, smoke-windows]
+    needs: [prepare, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      SHA: ${{ needs.prepare.outputs.sha }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
-      - run: scripts/release-notes.sh "$GITHUB_REF_NAME" > notes.md
-        env:
-          GH_TOKEN: ${{ github.token }}
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
       - uses: actions/download-artifact@v5
         with:
+          path: dist
           merge-multiple: true
-      - name: Check that the asset names match scripts/install.sh
+      - name: Aggregate checksums and check asset names against scripts/install.sh
         run: |
-          for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
-            test -f "${BIN_NAME}-${platform}.tar.gz"
-            test -f "${BIN_NAME}-${platform}.sha256"
-          done
-      - uses: softprops/action-gh-release@v2
-        with:
-          body_path: notes.md
-          files: |
-            *.tar.gz
-            *.zip
-            *.sha256
+          set -euo pipefail
+          cd dist
+          cat claude-codex-*.sha256 | sort -k2 > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          cd ..
+          scripts/check-release-assets.sh dist
+          ls -l dist
+      - name: Release notes
+        run: scripts/release-notes.sh "$TAG" "$SHA" > notes.md
+      - name: Create the release at the built commit
+        run: |
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$SHA" \
+            --title "$TAG" \
+            --notes-file notes.md

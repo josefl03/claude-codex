@@ -1,25 +1,50 @@
 #!/usr/bin/env bash
-# Print GitHub-style release notes for a tag: every non-merge commit since the
-# previous release, fork commits first, then the compare link. GitHub's own
-# generator picks the previous release but lists only merged PRs, which this
-# repo rarely has. The upstream owner is named without an @ so a sync does not
-# ping them, while other upstream contributors keep their mention.
+# Print release notes for a tag: the matching CHANGELOG.md section, then every
+# non-merge commit since the previous GitHub release (at most 20 when there is
+# none), then the compare link. Needs a full git history (fetch-depth: 0).
+# Authors are printed as plain names, never as @mentions, so a sync of upstream
+# commits does not ping anyone.
+#
+# Usage: release-notes.sh <tag> [<sha>]
+# With <sha> the tag does not need to exist yet (the release workflow creates it
+# at that exact commit afterwards). The previous release comes from
+# `gh release list`, so it needs GH_TOKEN and GITHUB_REPOSITORY (default
+# josefl03/claude-codex).
 set -euo pipefail
 
 tag="$1"
+sha="$(git rev-parse "${2:-$tag}^{commit}")"
 repo="${GITHUB_REPOSITORY:-josefl03/claude-codex}"
-upstream_owner="raine"
-compare="$(gh api "repos/$repo/releases/generate-notes" -f tag_name="$tag" --jq .body \
-  | grep -o "https://github.com/$repo/compare/[^ ]*")"
-fork_shas="$(gh api --paginate "repos/$repo/compare/$upstream_owner:main...$tag?per_page=100" \
-  --jq '.commits[].sha' | jq -R . | jq -s .)"
+root="$(cd "$(dirname "$0")/.." && pwd)"
+
+# Newest published release other than this tag whose tag is an ancestor of sha.
+prev=""
+while read -r candidate; do
+  [ "$candidate" = "$tag" ] && continue
+  if git rev-parse -q --verify "refs/tags/$candidate" >/dev/null \
+    && git merge-base --is-ancestor "$candidate" "$sha" 2>/dev/null; then
+    prev="$candidate"
+    break
+  fi
+done < <(gh release list --repo "$repo" --exclude-drafts --limit 50 --json tagName --jq '.[].tagName')
+
+# CHANGELOG.md section "## vX.Y.Z (date)" up to the next "## ".
+section="$(awk -v hdr="## $tag " 'index($0, hdr) == 1 { on = 1; next } on && /^## / { exit } on' "$root/CHANGELOG.md")"
+if [ -n "${section//[[:space:]]/}" ]; then
+  echo "$section" | sed -e '/./,$!d'
+  echo
+fi
 
 echo "## What's Changed"
-gh api "repos/$repo/compare/${compare##*/}" | jq -r --argjson fork "$fork_shas" --arg owner "$upstream_owner" '
-  [.commits[] | select(.parents | length == 1)]
-  | sort_by(.sha as $sha | $fork | index($sha) == null)
-  | .[]
-  | (.author.login // .commit.author.name) as $who
-  | "* \(.commit.message | split("\n")[0]) by \(if $who == $owner then $who else "@\($who)" end) in \(.sha)"'
-echo
-echo "**Full Changelog**: $compare"
+if [ -n "$prev" ]; then
+  range="$prev..$sha"
+  limit=()
+else
+  range="$sha"
+  limit=(-n 20)
+fi
+git log --no-merges "${limit[@]}" --format='* %s by %an in %h' "$range"
+if [ -n "$prev" ]; then
+  echo
+  echo "**Full Changelog**: https://github.com/$repo/compare/$prev...$tag"
+fi

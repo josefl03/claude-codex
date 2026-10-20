@@ -1,0 +1,42 @@
+name: Auto release
+
+# A push to main that changes Cargo.toml starts a release when the version in it
+# has no tag yet. Tags and releases created with GITHUB_TOKEN do not trigger other
+# workflows, but `gh workflow run` (workflow_dispatch) does, so this only starts
+# release.yml; release.yml creates the tag and the GitHub Release itself.
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  start:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start the release when the version is new
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          tag="v$version"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag already exists, nothing to release"
+            exit 0
+          fi
+          echo "Starting release $tag at $GITHUB_SHA"
+          gh workflow run release.yml --repo "$GITHUB_REPOSITORY" --ref main \
+            -f tag="$tag" -f sha="$GITHUB_SHA"

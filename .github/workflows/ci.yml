@@ -22,3 +22,17 @@ jobs:
         run: cargo install checkle just --locked
       - name: Run full checks
         run: just check-ci
+
+  versions:
+    name: Version and asset names
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Cargo.toml and Cargo.lock agree on the version
+        run: |
+          toml="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          lock="$(awk '/^name = "claude-codex"$/ { getline; gsub(/version = |"/, ""); print; exit }' Cargo.lock)"
+          echo "Cargo.toml: $toml, Cargo.lock: $lock"
+          test -n "$toml" && test "$toml" = "$lock"
+      - name: install.sh and the release workflow agree on asset names
+        run: scripts/check-release-assets.sh
