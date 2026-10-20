@@ -17,19 +17,19 @@ Pick the bump from the user's words (patch, minor, major). Never skip a step.
    - `cargo test --locked -- --test-threads=1`
 4. Commit (`build: release vX.Y.Z`) and `git push origin main`. Wait for the
    `CI` workflow on that commit to succeed.
-5. `git tag vX.Y.Z && git push origin vX.Y.Z`. Wait for the `Release` workflow:
-   six platform archives plus sha256 files, and a body from
-   `scripts/release-notes.sh`.
+5. The push starts `Auto release`, which starts `Release` for that commit:
+   four platform archives plus sha256 files and `SHA256SUMS`, tag and GitHub
+   Release created by the workflow itself (do not push a tag by hand). Watch it
+   with `gh run list --workflow release.yml`. Details: `docs/releasing.md`.
 6. `cargo publish --locked`, last, only after step 5 succeeded. A crates.io
    version can never be reused.
 
 ## Release notes
 
-The body is GitHub's "What's Changed" format, one line per non-merge commit
-since the previous release, fork commits first, so commit subjects are the
-release notes. The upstream owner is named without an @ so syncs do not ping
-them. To regenerate an existing release:
+The body is the CHANGELOG.md section of the version, then one line per non-merge commit
+since the previous release. Authors are plain names, never @mentions, so syncs
+do not ping anyone. To regenerate an existing release:
 
 ```bash
-gh release edit vX.Y.Z --notes-file <(scripts/release-notes.sh vX.Y.Z)
+gh release edit vX.Y.Z --notes-file <(scripts/release-notes.sh vX.Y.Z)   # needs a full clone with tags
 ```

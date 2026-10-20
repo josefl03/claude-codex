@@ -1,3 +1,18 @@
+## Unreleased
+
+- Prebuilt binaries are now published: v0.6.0 is the first release, with
+  `linux-amd64`, `linux-arm64`, `darwin-amd64` and `darwin-arm64` archives,
+  a `.sha256` for each, a combined `SHA256SUMS` and build provenance
+  attestations. Linux binaries are static (musl) and run on any distribution.
+  The Windows build was dropped; the installer never supported it.
+- Releases are automatic: a push to `main` that changes the `Cargo.toml`
+  version starts `release.yml`, which builds, tests, tags and publishes. It can
+  also be run by hand. See `docs/releasing.md`.
+- CI checks that `Cargo.toml` and `Cargo.lock` agree on the version and that
+  `scripts/install.sh` and the release use the same asset names.
+- `scripts/release-notes.sh` uses the `CHANGELOG.md` section plus local git
+  history, and no longer needs the tag to exist.
+
 ## v0.6.0 (2026-10-20)
 
 - `setup` and `enable` turn on systemd linger on Linux with plain

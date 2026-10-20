@@ -93,5 +93,5 @@ To keep merges cheap:
 
 - `ARCHITECTURE.md` describes the present and is rewritten whole.
 - `CHANGELOG_AI.md` describes the past; add an entry at the top, never edit old ones.
-- `CHANGELOG.md` gets a bullet per user-visible change under `Unreleased` until a release (see `.agents/skills/release/SKILL.md`).
+- `CHANGELOG.md` gets a bullet per user-visible change under `Unreleased` until a release (see `.agents/skills/release/SKILL.md` and [releasing.md](releasing.md)). Pushing a new version to `main` publishes the release automatically; do not change release asset names without changing `scripts/install.sh`.
 - Docs and code comments are in English; the repository is public.

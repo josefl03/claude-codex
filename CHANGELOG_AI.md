@@ -2,6 +2,22 @@
 
 Past work done with AI assistance, newest first. Entries are not edited retroactively. The present state is described in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## 2026-10-20: prebuilt binaries and automatic releases
+
+Why: no release existed, so the one-liner always fell back to `cargo install`. The inherited `release.yml` only ran on `v*` tag pushes, built glibc binaries (the upstream once shipped one that demanded GLIBC 2.39) and had never run in this repository.
+
+Changed:
+
+- `.github/workflows/release.yml`: now `workflow_dispatch` and `workflow_call` (inputs `tag`, `sha`). Jobs `prepare` (tag shape, tag equals `Cargo.toml` version, no existing release or tag), `checks`, `build` (matrix of `x86_64`/`aarch64-unknown-linux-musl` on `ubuntu-latest`/`ubuntu-24.04-arm` with `musl-tools`, and the two Apple targets; static check with `file`/`ldd`; archive test; `actions/attest-build-provenance@v3`) and `release` (`SHA256SUMS`, asset-name check, notes, `gh release create --target <sha>`). Windows targets removed. Per-tag concurrency group; permissions `contents: read` by default, `contents: write` only in `release`, `id-token`/`attestations: write` only in `build`.
+- `.github/workflows/auto-release.yml` (new): on a push to `main` touching `Cargo.toml`, starts `release.yml` with `gh workflow run` when `v<version>` has no release. A tag pushed with `GITHUB_TOKEN` would not trigger anything, hence dispatch (`actions: write` only in that job).
+- `.github/workflows/ci.yml`: job `versions` (Cargo.toml vs Cargo.lock, asset names).
+- `scripts/check-release-assets.sh` (new) and `scripts/release-notes.sh` (rewritten: the GitHub compare API 404s because this repository is not a GitHub fork of the upstream; it now uses `CHANGELOG.md` and local git history).
+- Docs: `docs/releasing.md` (new), README install section, AGENTS.md, ARCHITECTURE.md, `docs/development.md`, release skill, CHANGELOG.md.
+
+Found while testing in GitHub: the first run failed because a trailing comment on the `version` line leaked into the tag (the sed pattern now stops at the closing quote). `Cargo.toml` gained a comment line above `version`.
+
+Verified: release v0.6.0 was created by the automatic path (push to `main`, `Auto release`, `Release`) at commit f65878c; the Linux amd64 asset checked against its `.sha256`, `./claude-codex version` prints 0.6.0, `file` says static-pie, and the real one-liner downloaded the release (no cargo fallback) in a sandbox. Not verified: macOS and Linux arm64 binaries were built and ran `--version` in CI but were not run elsewhere; `gh attestation verify` could not be run locally (gh 2.46), the attestation exists in the API.
+
 ## 2026-10-20: automatic linger, single curl-bash installer, v0.6.0
 
 Why: the service was a systemd user unit but only started at login; `sudo loginctl enable-linger` was a manual step, and it turned out that plain `loginctl enable-linger` works for the user without sudo in a local session. The installer also needed to be one command that leaves everything configured.

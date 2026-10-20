@@ -26,7 +26,7 @@ It talks to endpoints that those companies do not document for third-party use, 
 
 - Claude Code, signed in with a Claude plan (Pro or Max).
 - A ChatGPT plan (Plus, Pro or Team) with the Codex CLI installed and signed in (`codex login`).
-- Linux or macOS. Rust only if you build from source.
+- Linux or macOS, on x86_64 or arm64. No Rust needed: the installer downloads a prebuilt binary.
 
 ## Quickstart
 
@@ -36,14 +36,25 @@ One command installs the binary and sets everything up:
 curl -fsSL https://raw.githubusercontent.com/josefl03/claude-codex/main/scripts/install.sh | bash
 ```
 
-The script needs no sudo and asks nothing. It installs into `~/.local/bin` (a prebuilt release with checksum, or `cargo install` when no binary exists for your platform and Rust is present), then runs `claude-codex enable`. That starts the autostart service, turns on systemd linger on Linux so the service also starts when the PC boots and nobody has logged in (plain `loginctl enable-linger`, no privileges needed; `disable` and `uninstall` turn it off again only if setup turned it on), creates the subagent cards and points Claude Code at the proxy. It ends with a short status table and what is left for you, such as restarting Claude Code. It checks the Codex login but never runs it for you.
+The script needs no sudo and asks nothing. It downloads the prebuilt binary for your platform from the latest [GitHub release](https://github.com/josefl03/claude-codex/releases), checks its SHA-256 and installs it into `~/.local/bin`, then runs `claude-codex enable`. That starts the autostart service, turns on systemd linger on Linux so the service also starts at boot (no privileges needed; `disable` and `uninstall` undo it), creates the subagent cards and points Claude Code at the proxy. It ends with a status table and what is left for you, such as restarting Claude Code. It checks the Codex login but never runs it for you.
 
-If you prefer cargo:
+Prebuilt binaries, one `.tar.gz` plus `.sha256` per platform and a combined `SHA256SUMS`:
+
+| Platform | Asset | Notes |
+|---|---|---|
+| Linux x86_64 | `claude-codex-linux-amd64.tar.gz` | static, runs on any distro |
+| Linux arm64 | `claude-codex-linux-arm64.tar.gz` | static, runs on any distro |
+| macOS Apple silicon | `claude-codex-darwin-arm64.tar.gz` | |
+| macOS Intel | `claude-codex-darwin-amd64.tar.gz` | |
+
+Windows has no binary. Cargo is only the alternative (the installer falls back to it when no asset matches and Rust is present):
 
 ```sh
 cargo install --git https://github.com/josefl03/claude-codex --locked
 claude-codex enable
 ```
+
+How releases are published and verified: [docs/releasing.md](docs/releasing.md).
 
 If the summary says the Codex login is missing, sign in once:
 
@@ -70,7 +81,7 @@ model: gpt-luna-latest
 You are a subagent running on `gpt-luna-latest`, which the claude-codex proxy resolves on every request to the newest luna model of the gpt family (currently `gpt-6-luna`, codex). Complete the task you are given and reply with the result only.
 ```
 
-Restart Claude Code to load new cards, then ask for a subagent by name. Some prompts:
+Restart Claude Code to load new cards, then ask for a subagent by name:
 
 ```text
 Use the gpt-sol-latest subagent to review this diff and list anything risky.
@@ -78,7 +89,7 @@ Start three gpt-luna-latest subagents in parallel to search the repo, one per to
 Ask the gpt-sol-latest subagent for a second opinion on this design before you change it.
 ```
 
-The fan-out prompt was run for real against this proxy. This is `claude -p --model haiku` from an empty directory, asking for three `gpt-luna-latest` subagents in parallel:
+The fan-out prompt, run for real with `claude -p --model haiku` from an empty directory:
 
 ```text
 Reply in English. Start three gpt-luna-latest subagents in parallel, one per question, each answering in one sentence: (1) what is git bisect for, (2) what is git reflog for, (3) what is git worktree for. Then print the three answers as a numbered list.
@@ -90,9 +101,7 @@ Reply in English. Start three gpt-luna-latest subagents in parallel, one per que
 3. `git worktree` lets you check out multiple branches of the same repository in separate directories, so you can work on them independently without switching branches in one directory.
 ```
 
-Claude Code may log `[claude-code:unrecognized_model]` for the `gpt-*` id; the request still goes through. More runs, including full `status` and `models` output, are in [docs/examples.md](docs/examples.md).
-
-The proxy only rewrites or deletes cards that carry its `managed-by: claude-codex` marker.
+Claude Code may log `[claude-code:unrecognized_model]` for the `gpt-*` id; the request still goes through. More runs are in [docs/examples.md](docs/examples.md). The proxy only rewrites or deletes cards with its `managed-by: claude-codex` marker.
 
 ### Aliases that follow the newest model
 
