@@ -4,6 +4,7 @@ pub mod auth;
 pub mod config;
 pub mod latest;
 pub mod lifecycle;
+pub mod linger;
 pub mod logging;
 pub mod model_discovery;
 pub mod monitor;

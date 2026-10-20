@@ -19,6 +19,7 @@
 //! Deletions use exact computed paths; the only recursive delete is the proxy's
 //! own state directory, and only when it is named `claude-code-proxy`.
 
+use crate::linger::{self, Loginctl};
 use crate::{agent_cards, config, paths, service, setup};
 use anyhow::{Result, bail};
 use clap::Args;
@@ -106,6 +107,8 @@ struct Context {
     loc: setup::Locations,
     state_exists: bool,
     state: std::result::Result<setup::SetupState, String>,
+    /// Set when linger could not be turned off: the setup record then stays.
+    linger_pending: std::cell::Cell<bool>,
 }
 
 pub fn run_uninstall(args: UninstallArgs) -> Result<()> {
@@ -117,6 +120,7 @@ pub fn run_uninstall(args: UninstallArgs) -> Result<()> {
         loc,
         state_exists,
         state,
+        linger_pending: std::cell::Cell::new(false),
     };
 
     if args.dry_run {
@@ -145,6 +149,7 @@ pub fn run_uninstall(args: UninstallArgs) -> Result<()> {
     let mut notes = Vec::new();
     let steps = vec![
         service_step(&ctx, &mut notes),
+        linger_step(&ctx),
         agents_step(&ctx),
         settings_step(&ctx, &mut notes),
         state_dir_step(&args, &ctx),
@@ -319,6 +324,31 @@ fn listener_note(dry_run: bool) -> Option<String> {
     })
 }
 
+// ---------- 1b: linger ----------
+
+/// Turn linger off again, but only when the setup record says setup turned it on.
+fn linger_step(ctx: &Context) -> Step {
+    const NAME: &str = "linger";
+    if service::Platform::current() != service::Platform::Linux {
+        return Step::skipped(NAME, "not applicable on this OS");
+    }
+    let mut recorded = match &ctx.state {
+        Ok(state) => state.linger_enabled_by_setup,
+        Err(_) => false,
+    };
+    let system = linger::system();
+    let backend = system.as_ref().map(|s| s as &dyn Loginctl);
+    match setup::release_linger(backend, &mut recorded, ctx.dry_run) {
+        Some((true, text)) => {
+            ctx.linger_pending.set(true);
+            Step::failed(NAME, text)
+        }
+        Some((false, text)) if text.starts_with("linger not touched") => Step::skipped(NAME, text),
+        Some((false, text)) => Step::ok(NAME, text),
+        None => Step::skipped(NAME, "not applicable on this OS"),
+    }
+}
+
 // ---------- 2: agent cards ----------
 
 fn agents_step(ctx: &Context) -> Step {
@@ -400,6 +430,9 @@ fn settings_step(ctx: &Context, notes: &mut Vec<String>) -> Step {
 fn finish_record(ctx: &Context, step: Step) -> Step {
     if ctx.dry_run || step.status == Status::Failed {
         return step;
+    }
+    if ctx.linger_pending.get() {
+        return step.detail("setup record kept: linger is still recorded; rerun uninstall");
     }
     match std::fs::remove_file(&ctx.loc.state_file) {
         Ok(()) => step.detail("setup record removed"),

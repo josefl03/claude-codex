@@ -133,6 +133,12 @@ jobs:
       - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
+      - name: Check that the asset names match scripts/install.sh
+        run: |
+          for platform in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            test -f "${BIN_NAME}-${platform}.tar.gz"
+            test -f "${BIN_NAME}-${platform}.sha256"
+          done
       - uses: softprops/action-gh-release@v2
         with:
           body_path: notes.md

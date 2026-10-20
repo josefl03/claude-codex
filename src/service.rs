@@ -271,7 +271,7 @@ pub fn run_service_command(command: ServiceCommand) -> Result<()> {
     }
     let (dir, manage) = target_dir(platform)?;
     match command {
-        ServiceCommand::Install => install(platform, &dir, manage),
+        ServiceCommand::Install => install(platform, &dir, manage, true),
         ServiceCommand::Disable => disable(platform, &dir, manage),
         ServiceCommand::Uninstall => uninstall(platform, &dir, manage),
         ServiceCommand::Status => status(platform, &dir, manage),
@@ -286,7 +286,18 @@ fn definition_path(platform: Platform, dir: &Path) -> PathBuf {
     }
 }
 
-fn install(platform: Platform, dir: &Path, manage: bool) -> Result<()> {
+/// Install and start the service without the linger hint: `setup` and `enable`
+/// handle linger themselves right after this.
+pub fn install_quiet() -> Result<()> {
+    let platform = Platform::current();
+    if platform == Platform::Other {
+        bail!(unsupported());
+    }
+    let (dir, manage) = target_dir(platform)?;
+    install(platform, &dir, manage, false)
+}
+
+fn install(platform: Platform, dir: &Path, manage: bool, linger_hint: bool) -> Result<()> {
     let spec = build_spec()?;
     let path = definition_path(platform, dir);
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -324,10 +335,10 @@ fn install(platform: Platform, dir: &Path, manage: bool) -> Result<()> {
                     &format!("{SERVICE_NAME}.service"),
                 ],
             )?;
-            if linger_enabled() == Some(false) {
+            if linger_hint && linger_enabled() == Some(false) {
                 println!(
                     "Linger is off: the service starts at login, not at boot.\n\
-                     To start it when the PC powers on, run:\n  sudo loginctl enable-linger $USER"
+                     `claude-codex enable` turns it on, or run: loginctl enable-linger"
                 );
             }
         }
@@ -508,7 +519,7 @@ fn status(platform: Platform, dir: &Path, manage: bool) -> Result<()> {
             match linger_enabled() {
                 Some(true) => println!("linger: on (starts at boot)"),
                 Some(false) => {
-                    println!("linger: off (starts at login; sudo loginctl enable-linger $USER)")
+                    println!("linger: off (starts at login; run `claude-codex enable`)")
                 }
                 None => println!("linger: unknown"),
             }

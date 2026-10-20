@@ -1,4 +1,25 @@
-## Unreleased
+## v0.6.0 (2026-10-20)
+
+- `setup` and `enable` turn on systemd linger on Linux with plain
+  `loginctl enable-linger` (no sudo), so the service starts when the PC boots
+  and not only at login. Already on: nothing is done or recorded. Enabled: the
+  `linger_enabled_by_setup` flag is written to `setup.json`. Failed (no polkit,
+  remote session, no `loginctl`): setup still succeeds and lists the manual
+  command as pending. `disable`, `setup --undo` and `uninstall` turn linger off
+  again only when that flag is set; `status` shows linger on or off and whether
+  setup turned it on. macOS prints nothing about linger. The old `sudo
+  loginctl enable-linger` hints are gone. Old `setup.json` files without the
+  field still load.
+- `scripts/install.sh` is the single installer and works as a one-liner:
+  `curl -fsSL https://raw.githubusercontent.com/josefl03/claude-codex/main/scripts/install.sh | bash`.
+  No sudo, no prompts, installs into `~/.local/bin`, verifies the checksum,
+  falls back to `cargo install --git` when no release asset exists, runs
+  `enable`, checks the Codex login and `claude` (never runs `codex login`) and
+  prints a status summary with what is left to do.
+- `release.yml` checks that the four Unix asset names `install.sh` downloads
+  exist before publishing.
+- README rewritten around Codex models as Claude Code subagents, with real
+  output; new `docs/examples.md`.
 
 - `claude-codex enable`, `disable` and `status`. `enable` is the idempotent
   switch-on (it is `setup` under another name, plus clearing the `disabled`

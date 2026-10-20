@@ -42,7 +42,7 @@ build:
 test:
     checkle run test
 
-# Install release binary globally
+# Developer install of this checkout (users install with scripts/install.sh)
 install:
     cargo install --offline --path . --locked
 

@@ -10,7 +10,7 @@ This file describes the present state of the code. It is rewritten, not appended
 |---|---|---|
 | Server, registry, Codex translator, monitor TUI | [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) | `src/server.rs`, `src/registry.rs`, `src/providers/codex`, `src/tui.rs`, `src/monitor*` |
 | Anthropic passthrough, reasoning portability, Codex CLI credentials, Codex catalog from `models_cache.json` | [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex) | `src/providers/anthropic`, `src/providers/translate_shared.rs`, `src/providers/codex/auth`, `src/providers/codex/translate/model_allowlist.rs` |
-| Autostart service, `setup`/`enable`/`disable`/`status`, agent cards, `-latest` aliases, live model refresh, own model discovery | this fork (josefl03/claude-codex) | `src/service.rs`, `src/setup.rs`, `src/lifecycle.rs`, `src/latest.rs`, `src/agent_cards.rs`, `src/model_discovery.rs`, `Registry::refresh`, mtime cache in `model_allowlist.rs`, `get_models` in `providers/codex/client.rs`, `scripts/install.sh` |
+| Autostart service, `setup`/`enable`/`disable`/`status`, agent cards, `-latest` aliases, live model refresh, own model discovery | this fork (josefl03/claude-codex) | `src/service.rs`, `src/linger.rs`, `src/setup.rs`, `src/lifecycle.rs`, `src/latest.rs`, `src/agent_cards.rs`, `src/model_discovery.rs`, `Registry::refresh`, mtime cache in `model_allowlist.rs`, `get_models` in `providers/codex/client.rs`, `scripts/install.sh` |
 
 ## Modules
 
@@ -148,7 +148,9 @@ A card is `<sanitized model>.md` with frontmatter `name`, `description`, `model`
 
 ## Service and setup
 
-`service.rs` renders a systemd user unit (`~/.config/systemd/user/claude-codex.service`, honoring `XDG_CONFIG_HOME`) or a LaunchAgent (`~/Library/LaunchAgents/com.claude-codex.proxy.plist`). Both run `<current exe> serve --no-monitor`. `<config dir>/service.env` is an optional `EnvironmentFile` on Linux and is inlined into the plist on macOS at install time. `CCP_SERVICE_DIR` switches to file-only mode: the file is written there and no `systemctl`/`launchctl` call is made.
+`service.rs` renders a systemd user unit (`~/.config/systemd/user/claude-codex.service`, honoring `XDG_CONFIG_HOME`) or a LaunchAgent (`~/Library/LaunchAgents/com.claude-codex.proxy.plist`). Both run `<current exe> serve --no-monitor`. `<config dir>/service.env` is an optional `EnvironmentFile` on Linux and is inlined into the plist on macOS at install time. `CCP_SERVICE_DIR` switches to file-only mode: the file is written there and no `systemctl`/`launchctl`/`loginctl` call is made.
+
+`linger.rs` owns systemd linger (Linux only). The `Loginctl` trait (`is_enabled`, `enable`, `disable`) is the only way code reaches `loginctl`; `SystemLoginctl` runs `loginctl show-user $USER -p Linger`, `loginctl enable-linger` and `loginctl disable-linger` with no arguments for the caller and never `sudo`. `linger::system()` returns it only on Linux and never when `CCP_SERVICE_DIR` is set, so callers pass `Option<&dyn Loginctl>` and tests pass `linger::fake::FakeLoginctl`. `linger::ensure` reads, enables if needed and reads again; `linger::release` acts only when the caller says setup recorded the activation. `setup::linger_step` turns the outcomes into report lines (already on: nothing recorded; enabled: `SetupState.linger_enabled_by_setup = true`; failed: a pending item with `loginctl enable-linger` and, as an alternative, `sudo loginctl enable-linger $USER`, never a failed step) and `setup::release_linger` is shared by `disable`, `setup --undo` and `uninstall`. `service::install_quiet` installs without the linger hint that `service install` prints. macOS prints nothing about linger.
 
 ```mermaid
 flowchart TD
@@ -157,10 +159,11 @@ flowchart TD
     G -- no --> ST
     CK --> ST["load setup.json state"]
     ST --> SV["service step<br/>(skipped by --no-service)"]
-    SV --> AG["agents step<br/>(skipped by --no-agents)"]
+    SV --> LG["linger step (Linux, after a successful service step):<br/>loginctl enable-linger, no sudo,<br/>failure is a pending item"]
+    LG --> AG["agents step<br/>(skipped by --no-agents)"]
     AG --> CS["settings step<br/>(skipped by --no-claude-settings)"]
     CS --> SAVE["save setup.json"]
-    SAVE --> CX["report: Codex login found?<br/>restart Claude Code, linger"]
+    SAVE --> CX["report: Codex login found?<br/>restart Claude Code, pending items"]
 ```
 
 The settings step (shared by `enable`) merges `env.ANTHROPIC_BASE_URL=http://127.0.0.1:<port>` and `env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` into `settings.json` under `$CLAUDE_CONFIG_DIR` or `~/.claude`. Invariants:
@@ -183,15 +186,21 @@ stateDiagram-v2
     Removed --> Enabled: enable
 ```
 
-`enable` is `setup` run through `setup::run_setup_as` with the title "Enable"; both first delete the `disabled` marker (unless `--dry-run` or `--no-agents`). `disable` runs, each step tolerant of the others failing: marker written; `settings.json` reverted with `unmerge_env` from `setup.json` (exact backup bytes when equal, `settings.json` removed if setup created it); managed cards removed (`clean_once`); service disabled (`ServiceCommand::Disable`: `systemctl --user disable --now`, or `launchctl bootout`, unit file kept); reverted entries cleared from `setup.json`; a listener left on the port reported, never killed. State per command:
+`enable` is `setup` run through `setup::run_setup_as` with the title "Enable"; both first delete the `disabled` marker (unless `--dry-run` or `--no-agents`). `disable` runs, each step tolerant of the others failing: marker written; `settings.json` reverted with `unmerge_env` from `setup.json` (exact backup bytes when equal, `settings.json` removed if setup created it); managed cards removed (`clean_once`); service disabled (`ServiceCommand::Disable`: `systemctl --user disable --now`, or `launchctl bootout`, unit file kept); linger turned off only if `setup.json` has `linger_enabled_by_setup` (then cleared); reverted entries cleared from `setup.json`; a listener left on the port reported, never killed. State per command:
 
-| | Unit file | Service enabled and active | Managed cards | `settings.json` entries | `disabled` marker |
-|---|---|---|---|---|---|
-| `enable`, `setup` | written | yes | yes | yes | no |
-| `disable` | kept | no | no | no | yes |
-| `setup --undo`, `uninstall` | removed | no | no | no | no |
+| | Unit file | Service enabled and active | Linger (Linux) | Managed cards | `settings.json` entries | `disabled` marker |
+|---|---|---|---|---|---|---|
+| `enable`, `setup` | written | yes | on; recorded only if setup turned it on | yes | yes | no |
+| `disable` | kept | no | off only if recorded, else untouched | no | no | yes |
+| `setup --undo`, `uninstall` | removed | no | off only if recorded, else untouched | no | no | no |
 
 Invariant: after `disable`, `settings.json` never keeps an `ANTHROPIC_BASE_URL` that `enable` added. One for this proxy that the user wrote is not ours to remove, so `disable` warns instead. `status` reads the service through `service::inspect`, the port with a plain TCP connect and `GET /healthz`, `settings.json` without writing, the cards with `scan`, and the Codex login from the credential file; it changes nothing. All three commands go through `setup::Locations::resolve`, so the sandbox guard applies.
+
+## Installer and releases
+
+`scripts/install.sh` is the only installer (`curl -fsSL .../scripts/install.sh | bash`). Everything lives in functions and `main "$@"` is the last line, so a truncated download runs nothing; child commands read `/dev/null` so they cannot swallow the piped script; it never uses `sudo` and never prompts. Flow: detect `linux|darwin` x `amd64|arm64`; resolve the latest release tag (or `CLAUDE_CODEX_VERSION`); download `claude-codex-<platform>.tar.gz` and `.sha256` and verify (mismatch aborts); if the release or asset does not exist and `cargo` is present, `cargo install --git ... --locked --root <tmp>`; otherwise fail with the two ways forward. The binary goes to `CLAUDE_CODEX_INSTALL_DIR` (default `~/.local/bin`, must be writable) with a PATH line printed when needed. Then `claude-codex enable` (a failure is reported, not fatal), `claude-codex codex auth status` (never `codex login`), a check for `claude` in PATH, and a summary built from `claude-codex status` plus a "Still to do" list. `CLAUDE_CODEX_LOCAL_BINARY` skips the download for tests.
+
+`.github/workflows/release.yml` (tag `v*`, `GITHUB_TOKEN` only) runs the tests, builds six targets, writes `claude-codex-<platform>.tar.gz|zip` plus `.sha256` (platform names `linux-amd64`, `linux-arm64`, `darwin-amd64`, `darwin-arm64`, `windows-amd64`, `windows-arm64`), checks that the four Unix names `install.sh` downloads exist, and publishes the release. Publishing to crates.io is a manual step outside the workflow.
 
 ## Uninstall
 
@@ -203,7 +212,8 @@ flowchart TD
     TTY -- "neither" --> REF["refuse, change nothing"]
     TTY -- "yes / y" --> S1
     CF -- yes --> S1["1 service: service::uninstall"]
-    S1 --> S2["2 cards: clean_once (marker only)"]
+    S1 --> L1["1b linger: loginctl disable-linger<br/>only if setup.json says setup enabled it"]
+    L1 --> S2["2 cards: clean_once (marker only)"]
     S2 --> S3["3 settings: unmerge_env from setup.json,<br/>restore backup bytes if identical,<br/>drop setup.json"]
     S3 --> S4["4 --purge: state dir<br/>--purge-credentials: proxy config files"]
     S4 --> S5["5 binary: known dir, not under target/"]
@@ -212,7 +222,7 @@ flowchart TD
 
 Steps are independent and never abort the run. Invariants (`src/uninstall.rs`): the only recursive delete is the state directory, and only when it is named `claude-code-proxy`; credentials are deleted by exact path (`<provider>/auth.json`, provider device-id files, `config.json`, `service.env`) and only with `--purge-credentials`; `~/.codex` and `CCP_CODEX_AUTH_FILE` are never touched; without a setup record `settings.json` is never touched; a manual `serve` is never stopped, only reported; the binary is deleted only if named `claude-codex`, in `~/.local/bin`, `~/.cargo/bin`, `/usr/local/bin` (not in sandbox mode) or `CLAUDE_CODEX_INSTALL_DIR`, and never from a path with a `target` component. `setup.json` records `settings_created` so a `settings.json` that setup created is removed again.
 
-`uninstall` also removes the `disabled` marker. `serve` prints a one-line hint to run `enable` when stderr is a terminal and no `setup.json` exists.
+If linger cannot be turned off, the step fails and the setup record is kept so a rerun still knows. `uninstall` also removes the `disabled` marker. `serve` prints a one-line hint to run `enable` when stderr is a terminal and no `setup.json` exists.
 
 ## Credentials and security model
 

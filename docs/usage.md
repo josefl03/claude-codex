@@ -22,6 +22,16 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-haiku-5-5   # stays on Claude
 
 Do not set `ANTHROPIC_AUTH_TOKEN` or `ANTHROPIC_API_KEY`; Claude Code forwards its subscription login for `claude-*` models only when no explicit token is present.
 
+## Install
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/josefl03/claude-codex/main/scripts/install.sh | bash
+```
+
+`scripts/install.sh` is the only installer. It never uses sudo and never prompts. It installs into `~/.local/bin` (override with `CLAUDE_CODEX_INSTALL_DIR`; the directory must be writable), taking the latest release for `linux` or `darwin` on `amd64` or `arm64` and checking its `.sha256`. With no release or no asset for your platform it runs `cargo install --git https://github.com/josefl03/claude-codex --locked` when `cargo` exists, and otherwise stops with both options spelled out. Then it runs `claude-codex enable` (a failure is reported with the retry command, the install stays), checks the Codex login with `claude-codex codex auth status` (it never runs `codex login`; if the login or the Codex CLI is missing it prints `codex login` and the install commands `npm install -g @openai/codex` or `brew install --cask codex`), checks that `claude` is in `PATH`, and prints a summary and a "Still to do" list. If the install directory is not in `PATH` it prints the exact `export PATH=...` line.
+
+Variables: `CLAUDE_CODEX_VERSION` (a tag such as `v0.6.0`), `CLAUDE_CODEX_REPO`, `CLAUDE_CODEX_INSTALL_DIR`, `CLAUDE_CODEX_NO_SETUP=1` (binary only), `CLAUDE_CODEX_LOCAL_BINARY` (testing). `just install` is for developers and runs `cargo install` on a checkout.
+
 ## Enable, disable and status
 
 ```sh
@@ -30,7 +40,7 @@ claude-codex disable [--dry-run]            # switch it off, keep the install
 claude-codex status                         # one screen, changes nothing
 ```
 
-**`enable`** makes sure that: the autostart service is installed (its unit rewritten with the path of the running binary), enabled and started; the agent cards are synced and `serve` syncs them again; `env.ANTHROPIC_BASE_URL` (and `env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) are in Claude Code's `settings.json`; and the `disabled` marker is gone. It is `setup` under another name and obeys the same safety rules: a different `ANTHROPIC_BASE_URL` stays unless you pass `--force`, a backup is made once, and invalid JSON is an error that leaves the file untouched. After `disable`, a previously `--force`d replacement needs `--force` again.
+**`enable`** makes sure that: the autostart service is installed (its unit rewritten with the path of the running binary), enabled and started; on Linux, systemd linger is turned on (unless it already is) so the service also starts at boot; the agent cards are synced and `serve` syncs them again; `env.ANTHROPIC_BASE_URL` (and `env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`) are in Claude Code's `settings.json`; and the `disabled` marker is gone. It is `setup` under another name and obeys the same safety rules: a different `ANTHROPIC_BASE_URL` stays unless you pass `--force`, a backup is made once, and invalid JSON is an error that leaves the file untouched. After `disable`, a previously `--force`d replacement needs `--force` again.
 
 **`disable`** switches the proxy off without removing it, in this order, continuing past a failed step (the exit code is then non-zero):
 
@@ -38,20 +48,21 @@ claude-codex status                         # one screen, changes nothing
 2. removes from `settings.json` the entries setup added, and puts back a value that `--force` replaced. This is not optional: leaving `ANTHROPIC_BASE_URL` pointing at a stopped proxy would break Claude Code. When the result equals the pre-setup backup, its exact bytes are written back; a `settings.json` that setup created and nothing else lives in is removed. A `ANTHROPIC_BASE_URL` for this proxy that the user wrote (setup never recorded it) is left, with a warning;
 3. removes the managed agent cards (marker rule as always);
 4. stops and disables the service (`systemctl --user disable --now`; `launchctl bootout` on macOS) and keeps the unit or plist file;
-5. forgets the reverted entries in `setup.json` but keeps the file.
+5. turns linger off if `setup.json` says setup turned it on (`loginctl disable-linger`), and clears that record; a linger you enabled yourself is left alone, and the output says which case applied;
+6. forgets the reverted entries in `setup.json` but keeps the file.
 
 It never deletes the binary, provider logins, caches or `setup.json`, and it does not stop a `serve` you started by hand: if something still listens on the port it says so. At the end it reminds you to restart Claude Code; run `enable` and restart Claude Code to switch back.
 
-**`status`** prints: enabled or disabled (the marker), the service (installed, active, enabled, linger on Linux), the port and whether `/healthz` answers, whether `settings.json` has `ANTHROPIC_BASE_URL` and whether it is this proxy, the number of managed cards, the version and whether a Codex login exists. With `CCP_SERVICE_DIR` set the service manager is not queried and `status` says so.
+**`status`** prints: enabled or disabled (the marker), the service (installed, active, enabled), linger on Linux (on or off, and whether setup turned it on), the port and whether `/healthz` answers, whether `settings.json` has `ANTHROPIC_BASE_URL` and whether it is this proxy, the number of managed cards, the version and whether a Codex login exists. With `CCP_SERVICE_DIR` set the service manager is not queried and `status` says so.
 
 State left by each command (checked by `tests/setup.rs`):
 
-| Command | Binary | Service unit file | Service enabled and running | Managed cards | `settings.json` entries | `setup.json` | `disabled` marker | Logins and caches |
-|---|---|---|---|---|---|---|---|---|
-| `install.sh`, `enable`, `setup` | kept or installed | written | yes | synced | present | updated | removed | untouched |
-| `disable` | kept | kept | no | removed | removed (previous value restored) | kept, reverted entries cleared | written | untouched |
-| `setup --undo` | kept | removed if setup installed it | no | removed | removed | removed | removed | untouched |
-| `uninstall` | removed | removed | no | removed | removed | removed | removed | untouched; `--purge` deletes state, `--purge-credentials` also the proxy logins |
+| Command | Binary | Service unit file | Service enabled and running | Linger (Linux) | Managed cards | `settings.json` entries | `setup.json` | `disabled` marker | Logins and caches |
+|---|---|---|---|---|---|---|---|---|---|
+| `install.sh`, `enable`, `setup` | kept or installed | written | yes | on (recorded as `linger_enabled_by_setup` only if setup turned it on) | synced | present | updated | removed | untouched |
+| `disable` | kept | kept | no | off only if setup turned it on, else as it was | removed | removed (previous value restored) | kept, reverted entries cleared | written | untouched |
+| `setup --undo` | kept | removed if setup installed it | no | off only if setup turned it on, else as it was | removed | removed | removed | removed | untouched |
+| `uninstall` | removed | removed | no | off only if setup turned it on, else as it was | removed | removed | removed | removed | untouched; `--purge` deletes state, `--purge-credentials` also the proxy logins |
 
 `~/.codex` is untouched by every command.
 
@@ -83,6 +94,7 @@ claude-codex uninstall --dry-run     # show what would be done, change nothing
 It undoes `setup` and `scripts/install.sh` in this order. Each step is independent: one that fails does not stop the others, the summary marks each with a check mark, a dash (skipped) or a cross, and the exit code is non-zero if any failed. Running it twice is safe.
 
 1. **Service.** Stops and disables the systemd user unit or LaunchAgent and deletes its file (same code as `service uninstall`). A manual `claude-codex serve` is never stopped; if something still listens on the configured port, uninstall says so.
+   Linger (Linux): it runs `loginctl disable-linger` only when `setup.json` says setup turned linger on; a linger you enabled yourself is not touched, and the step says which case applied. If it fails, the setup record is kept so a rerun can retry.
 2. **Subagent cards.** Same as `agents clean`: only files carrying the `managed-by: claude-codex` marker are removed, including cards written by earlier versions as `ccp-<model>.md`.
 3. **Claude Code settings.** Uses `setup.json` (state directory) to remove only the keys setup added and restore a value it replaced with `--force`, and only where the value is still the one setup wrote. Other keys and their order are kept. When the result is the same document as the pre-setup backup, the backup's exact bytes are written back. If setup created `settings.json` and nothing else lives in it, the file is removed. `settings.json.claude-codex.bak` is left in place and reported. Restart Claude Code afterwards.
    Without a setup record (setup never ran, or it was already undone), `settings.json` is not touched and uninstall tells you to remove `ANTHROPIC_BASE_URL` yourself if you want to.
@@ -101,7 +113,7 @@ claude-codex service restart
 claude-codex service uninstall
 ```
 
-Linux installs a systemd user unit (`~/.config/systemd/user/claude-codex.service`); macOS installs a LaunchAgent (`~/Library/LaunchAgents/com.claude-codex.proxy.plist`). Both run `serve --no-monitor`. Other systems are not supported. On Linux the service starts at login unless lingering is on; `install` prints `sudo loginctl enable-linger $USER` when needed.
+Linux installs a systemd user unit (`~/.config/systemd/user/claude-codex.service`); macOS installs a LaunchAgent (`~/Library/LaunchAgents/com.claude-codex.proxy.plist`). Both run `serve --no-monitor`. Other systems are not supported. On Linux a user service starts at login unless linger is on for the user. `setup` and `enable` turn it on with plain `loginctl enable-linger` (no sudo: polkit allows it for your own account in a local session) and record that in `setup.json` as `linger_enabled_by_setup`; if linger is already on they do nothing and record nothing. If it cannot be enabled (a remote session without polkit access, no `loginctl`), setup still succeeds and lists the manual command under "Still to do": `loginctl enable-linger`, or `sudo loginctl enable-linger $USER` as a last resort. macOS has no linger: the LaunchAgent starts at login. `service install` alone only prints a hint.
 
 To pass settings such as `PORT` or other `CCP_*` variables, write `KEY=VALUE` lines to `service.env` in the config directory. On macOS the file is read when you run `service install`, so rerun it after editing.
 

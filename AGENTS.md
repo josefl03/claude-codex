@@ -50,6 +50,7 @@ the Codex CLI cache while running. The map of modules and flows is in
   that refreshes models and then syncs the cards.
 - `src/service.rs` manages the autostart service (systemd user unit, macOS
   LaunchAgent) behind `claude-codex service ...`.
+- `src/linger.rs` owns systemd linger behind the injectable `Loginctl` trait; `setup.rs` records `linger_enabled_by_setup` and `disable`, `setup --undo` and `uninstall` revert it only when recorded.
 - `src/setup.rs` implements `claude-codex setup`: service, cards and the merge of
   `ANTHROPIC_BASE_URL` into Claude Code's `settings.json`, with `--undo`.
 - `src/lifecycle.rs` implements `enable` (the setup logic plus clearing the
@@ -115,6 +116,8 @@ the Codex CLI cache while running. The map of modules and flows is in
   exact path; `~/.codex` never; no `serve` process is ever killed; the binary only
   from a known install directory and never from `target/`. Its only recursive
   delete is the state directory named `claude-code-proxy`.
+- Never invoke `sudo`, anywhere (code, `scripts/install.sh`, tests). Linger is enabled with plain `loginctl enable-linger`; if that fails, `setup` still succeeds and only prints the manual command (the `sudo` form is text for the user, never executed). Linger is turned off again (`disable`, `setup --undo`, `uninstall`) only when `setup.json` says setup turned it on; a linger the user enabled is never touched. All `loginctl` calls go through `linger::Loginctl`, `linger::system()` is `None` under `CCP_SERVICE_DIR` and off Linux, and tests use `FakeLoginctl`, never the real command.
+- `scripts/install.sh` is the only installer: everything inside functions with `main "$@"` last, no prompts, no sudo, child commands read `/dev/null`, asset names `claude-codex-<os>-<arch>.tar.gz` and `.sha256` matching `release.yml`, and it never runs `codex login`.
 - Code and tests that write outside the proxy's own directories must honor an env
   override per location and must never touch the real home directory. See the
   safety rule in `docs/development.md`.
@@ -142,8 +145,8 @@ future cleanup:
 Install paths: `cargo install --git https://github.com/josefl03/claude-codex --locked`
 followed by `claude-codex setup`; `cargo install claude-codex` once published to
 crates.io; and prebuilt binaries from the `v*`-tag release workflow in
-`.github/workflows/release.yml`, installed by `scripts/install.sh` (repository
-configurable through `CLAUDE_CODEX_REPO`).
+`.github/workflows/release.yml`, installed by `scripts/install.sh`, the one-liner (repository
+configurable through `CLAUDE_CODEX_REPO`; falls back to `cargo install --git` when no release asset exists).
 That workflow uses the default `GITHUB_TOKEN` and needs no secrets or Homebrew
 tap.
 

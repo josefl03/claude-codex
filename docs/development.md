@@ -40,6 +40,8 @@ Rules:
 - Tests for `service` and `agents` set `CCP_SERVICE_DIR` / `CCP_AGENTS_DIR` to a `tempfile` directory (see `tests/cli.rs`).
 - When you run the binary by hand while developing, export `CCP_SETUP_SANDBOX=1` plus the variables, or use `--dry-run`. Never run `service install` or `setup` unsandboxed on a machine whose configuration you care about unless you intend to.
 - Unit tests of pure functions (`render_systemd_unit`, `plan`, `merge_env`) need no filesystem.
+- Linger: unit-test `linger_step`/`release_linger` with `linger::fake::FakeLoginctl`; integration tests run with `CCP_SERVICE_DIR`, so the real `loginctl` is never called. Do not run `enable`, `disable`, `setup` or `uninstall` unsandboxed on a machine with a live service.
+- `scripts/install.sh` is tested by running it with `CLAUDE_CODEX_LOCAL_BINARY`, a temporary `HOME` and every redirect variable above (plus `CCP_SETUP_SANDBOX=1`); `bash -n` and `shellcheck` should pass.
 - `enable`, `disable` and `status` go through the same guard and tests: add their cases to `tests/setup.rs` via `Sandbox::cmd`. `disable` and `status` also read `<XDG_STATE_HOME>/claude-code-proxy/disabled`, so it must stay inside the sandbox.
 - Keep tests hermetic: toy credentials and mock upstreams, never the real `~/.codex/auth.json` or a live backend. `cli_models()` returns an empty list under `cfg!(test)` so unit tests do not depend on a developer's account.
 

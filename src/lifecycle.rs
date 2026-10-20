@@ -16,6 +16,7 @@
 //! Like `setup`, every command here resolves its locations through
 //! [`setup::Locations`], so the sandbox guard (`CCP_SETUP_SANDBOX`) applies.
 
+use crate::linger::{self, Loginctl};
 use crate::setup::{self, BASE_URL_KEY, Locations, Report, SetupArgs, SetupState};
 use crate::{agent_cards, config, paths, service, uninstall};
 use anyhow::{Context, Result, bail};
@@ -240,11 +241,30 @@ pub fn run_disable(args: DisableArgs) -> Result<()> {
         }
     }
 
+    // 4b. Linger goes off again only if setup turned it on.
+    let linger_was_recorded = state.linger_enabled_by_setup;
+    {
+        let system = linger::system();
+        let backend = system.as_ref().map(|s| s as &dyn Loginctl);
+        if let Some((failed, text)) =
+            setup::release_linger(backend, &mut state.linger_enabled_by_setup, dry_run)
+        {
+            if failed {
+                report.failed.push(text);
+            } else {
+                report.done.push(text);
+            }
+        }
+    }
+    let linger_changed = linger_was_recorded != state.linger_enabled_by_setup;
+
     // 5. Forget the entries that were reverted; keep the record itself.
-    if !dry_run && settings_reverted && state_existed {
-        state.added.clear();
-        state.replaced.clear();
-        state.env_created = false;
+    if !dry_run && (settings_reverted || linger_changed) && state_existed {
+        if settings_reverted {
+            state.added.clear();
+            state.replaced.clear();
+            state.env_created = false;
+        }
         if let Err(err) = setup::save_state(&loc.state_file, &state) {
             report.failed.push(format!("setup record: {err:#}"));
         }
@@ -326,6 +346,8 @@ pub struct StatusReport {
     pub disabled: bool,
     pub marker: PathBuf,
     pub service: service::ServiceInfo,
+    /// `setup.json` says setup turned linger on.
+    pub linger_by_setup: bool,
     pub port: u16,
     pub listening: bool,
     pub responds: bool,
@@ -388,9 +410,12 @@ pub fn render_status(report: &StatusReport) -> String {
         line(
             "linger",
             match svc.linger {
-                Some(true) => "on (starts at boot)".to_string(),
+                Some(true) if report.linger_by_setup => {
+                    "on (starts at boot; enabled by setup)".to_string()
+                }
+                Some(true) => "on (starts at boot; not enabled by setup)".to_string(),
                 Some(false) => {
-                    "off (starts at login; sudo loginctl enable-linger $USER)".to_string()
+                    "off (starts at login; `claude-codex enable` turns it on)".to_string()
                 }
                 None => "unknown".to_string(),
             },
@@ -500,6 +525,9 @@ fn gather_status(loc: &Locations) -> StatusReport {
         disabled: is_disabled(),
         marker: marker_path(),
         service: service::inspect(),
+        linger_by_setup: setup::load_state(&loc.state_file)
+            .map(|state| state.linger_enabled_by_setup)
+            .unwrap_or(false),
         port,
         listening,
         responds: listening && healthz_ok(port),
@@ -541,6 +569,7 @@ mod tests {
                 linger: Some(true),
                 unmanaged: false,
             },
+            linger_by_setup: true,
             port: 18765,
             listening: true,
             responds: true,
@@ -605,5 +634,28 @@ mod tests {
         let text = render_status(&r);
         assert!(text.contains("service manager calls are off"), "{text}");
         assert!(!text.contains("linger"), "{text}");
+    }
+
+    #[test]
+    fn status_says_who_turned_linger_on() {
+        let text = render_status(&report());
+        assert!(
+            text.contains("on (starts at boot; enabled by setup)"),
+            "{text}"
+        );
+        let mut r = report();
+        r.linger_by_setup = false;
+        let text = render_status(&r);
+        assert!(
+            text.contains("on (starts at boot; not enabled by setup)"),
+            "{text}"
+        );
+        r.service.linger = Some(false);
+        let text = render_status(&r);
+        assert!(
+            text.contains("off (starts at login; `claude-codex enable` turns it on)"),
+            "{text}"
+        );
+        assert!(!text.contains("sudo"), "{text}");
     }
 }

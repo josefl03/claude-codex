@@ -402,6 +402,17 @@ fn copy_binary(sb: &Sandbox, relative_dir: &str) -> PathBuf {
     std::fs::create_dir_all(&dir).unwrap();
     let dst = dir.join("claude-codex");
     std::fs::copy(src, &dst).unwrap();
+    // Another test thread may fork while the copy is open for writing, and the
+    // child keeps that descriptor until it execs: running the copy then fails
+    // with ETXTBSY ("text file busy"). Wait until the copy can be executed.
+    for _ in 0..100 {
+        match std::process::Command::new(&dst).arg("--version").output() {
+            Err(err) if err.raw_os_error() == Some(26) => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => break,
+        }
+    }
     dst
 }
 
@@ -1202,4 +1213,67 @@ fn status_reflects_each_state() {
     sb.write_settings(r#"{"env":{"ANTHROPIC_BASE_URL":"https://gateway.example"}}"#);
     let (_, out) = sb.run(&["status"]);
     assert!(out.contains("(not this proxy)"), "{out}");
+}
+
+// ---------- linger ----------
+
+fn write_state(sb: &Sandbox, text: &str) {
+    std::fs::create_dir_all(sb.state_file().parent().unwrap()).unwrap();
+    std::fs::write(sb.state_file(), text).unwrap();
+}
+
+#[test]
+fn sandboxed_setup_never_touches_or_mentions_linger() {
+    let sb = Sandbox::new();
+    let (ok, text) = sb.run(&["setup"]);
+    assert!(ok, "{text}");
+    assert!(!text.to_lowercase().contains("linger"), "{text}");
+    assert!(!text.contains("sudo"), "{text}");
+    let state: Value =
+        serde_json::from_str(&std::fs::read_to_string(sb.state_file()).unwrap()).unwrap();
+    assert_eq!(state["linger_enabled_by_setup"], json!(false));
+}
+
+#[test]
+fn an_old_record_without_the_linger_field_is_read_and_linger_is_left_alone() {
+    let sb = Sandbox::new();
+    write_state(&sb, r#"{"service_installed": true, "agents_synced": true}"#);
+    let (ok, text) = sb.run(&["disable"]);
+    assert!(ok, "{text}");
+    if cfg!(target_os = "linux") {
+        assert!(
+            text.contains("linger not touched: setup did not turn it on"),
+            "{text}"
+        );
+    }
+    let (ok, text) = sb.run(&["status"]);
+    assert!(ok, "{text}");
+    let (ok, text) = uninstall(&sb, &[]);
+    assert!(ok, "{text}");
+}
+
+#[test]
+fn with_a_linger_record_the_sandbox_neither_runs_loginctl_nor_loses_the_record() {
+    let sb = Sandbox::new();
+    write_state(
+        &sb,
+        r#"{"service_installed": true, "linger_enabled_by_setup": true}"#,
+    );
+    let (ok, text) = sb.run(&["disable", "--dry-run"]);
+    assert!(ok, "{text}");
+    let (ok, text) = sb.run(&["disable"]);
+    assert!(ok, "{text}");
+    if cfg!(target_os = "linux") {
+        assert!(text.contains("linger left as it is"), "{text}");
+        let state: Value =
+            serde_json::from_str(&std::fs::read_to_string(sb.state_file()).unwrap()).unwrap();
+        assert_eq!(state["linger_enabled_by_setup"], json!(true));
+    }
+    let (ok, text) = sb.run(&["setup", "--undo", "--dry-run"]);
+    assert!(ok, "{text}");
+    let (ok, text) = uninstall(&sb, &["--dry-run"]);
+    assert!(ok, "{text}");
+    if cfg!(target_os = "linux") {
+        assert!(text.contains("linger"), "{text}");
+    }
 }

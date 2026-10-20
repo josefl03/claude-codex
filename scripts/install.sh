@@ -1,341 +1,354 @@
 #!/usr/bin/env bash
 #
-# claude-codex installation script
-# Usage: curl -fsSL https://raw.githubusercontent.com/josefl03/claude-codex/main/scripts/install.sh | bash
+# claude-codex installer, the only one. Safe to pipe into bash:
 #
-# Binaries are downloaded from the GitHub releases of ${CLAUDE_CODEX_REPO}. Until the first
-# release of that repository exists, install with:
-#   cargo install --git https://github.com/josefl03/claude-codex --locked && claude-codex setup
+#   curl -fsSL https://raw.githubusercontent.com/josefl03/claude-codex/main/scripts/install.sh | bash
+#
+# What it does, without prompts and without sudo:
+#   1. installs the binary into ~/.local/bin (prebuilt release with checksum; if no
+#      release or no asset exists for your platform and `cargo` is available, builds
+#      with `cargo install --git`);
+#   2. runs `claude-codex enable` (autostart service, linger, subagent cards,
+#      ANTHROPIC_BASE_URL in Claude Code's settings.json);
+#   3. checks the Codex login and Claude Code, and prints a status summary with what
+#      is still left for you. It never runs `codex login` for you.
 #
 # Environment variables:
-#   CLAUDE_CODEX_REPO         - GitHub repository to download releases from, as owner/name
-#                               (default: josefl03/claude-codex)
-#   CLAUDE_CODEX_VERSION      - Pin a specific version (e.g., v0.1.0)
-#   CLAUDE_CODEX_INSTALL_DIR  - Override install directory (default: /usr/local/bin or ~/.local/bin)
-#   CLAUDE_CODEX_NO_SETUP     - Set to 1 to skip the automatic `claude-codex enable` after installing
-#   CLAUDE_CODEX_LOCAL_BINARY - Testing override: install this local binary instead of
-#                               downloading a release (no network, no checksum)
+#   CLAUDE_CODEX_REPO         GitHub repository, owner/name (default: josefl03/claude-codex)
+#   CLAUDE_CODEX_VERSION      Pin a release tag, for example v0.6.0 (default: latest)
+#   CLAUDE_CODEX_INSTALL_DIR  Install directory (default: ~/.local/bin). Must be writable:
+#                             the installer never uses sudo
+#   CLAUDE_CODEX_NO_SETUP     Set to 1 to install the binary only, without `enable`
+#   CLAUDE_CODEX_LOCAL_BINARY Testing: install this local binary instead of downloading
 #
-# After installing, the script runs `claude-codex enable` (autostart service, subagent
-# cards, Claude Code settings). If that fails the install still succeeds; rerun it with
-# `claude-codex enable`. Switch it off with `claude-codex disable`, or remove everything
-# (service, cards, settings, binary) with `claude-codex uninstall`.
-#
-# Examples:
-#   CLAUDE_CODEX_VERSION=v0.1.0 bash install.sh
-#   CLAUDE_CODEX_INSTALL_DIR=/opt/bin bash install.sh
-#   CLAUDE_CODEX_NO_SETUP=1 bash install.sh
-#   CLAUDE_CODEX_LOCAL_BINARY=target/debug/claude-codex CLAUDE_CODEX_INSTALL_DIR=/tmp/bin bash install.sh
-#
+# Undo: `claude-codex disable` switches it off, `claude-codex uninstall` removes it.
 
 set -euo pipefail
-
-TMP_DIR=""
-INSTALL_DIR=""
-RELEASE_VERSION=""
 
 BIN_NAME="claude-codex"
 REPO="${CLAUDE_CODEX_REPO:-josefl03/claude-codex}"
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
+TMP_DIR=""
+BIN_SRC=""
+INSTALLED_BIN=""
+PLATFORM=""
+RELEASE_VERSION=""
+ENABLE_STATE="not run"
+PENDING=()
 
-log_info()    { echo -e "${BLUE}==>${NC} $1"; }
-log_success() { echo -e "${GREEN}==>${NC} $1"; }
-log_warning() { echo -e "${YELLOW}==>${NC} $1"; }
-log_error()   { echo -e "${RED}Error:${NC} $1" >&2; }
+if [ -t 1 ]; then
+	C_RED=$'\033[0;31m'; C_GREEN=$'\033[0;32m'; C_YELLOW=$'\033[1;33m'; C_BLUE=$'\033[0;34m'; C_OFF=$'\033[0m'
+else
+	C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_OFF=""
+fi
+
+log_info()    { printf '%s==>%s %s\n' "$C_BLUE" "$C_OFF" "$1"; }
+log_success() { printf '%s==>%s %s\n' "$C_GREEN" "$C_OFF" "$1"; }
+log_warning() { printf '%s==>%s %s\n' "$C_YELLOW" "$C_OFF" "$1"; }
+log_error()   { printf '%sError:%s %s\n' "$C_RED" "$C_OFF" "$1" >&2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+cleanup() {
+	if [ -n "${TMP_DIR:-}" ]; then
+		rm -rf "$TMP_DIR"
+	fi
+}
+
+# download URL DEST: quiet, with retries. Non-zero when the file is not available.
+download() {
+	local url=$1 dest=$2
+	if have curl; then
+		curl -fsL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 180 -o "$dest" "$url" </dev/null
+	elif have wget; then
+		wget --tries=3 --timeout=60 -q -O "$dest" "$url" </dev/null
+	else
+		log_error "Neither curl nor wget found. Install one of them and rerun."
+		exit 1
+	fi
+}
 
 detect_platform() {
 	local os arch
-
 	case "$(uname -s)" in
 	Darwin) os="darwin" ;;
 	Linux)  os="linux" ;;
 	*)
-		log_error "Unsupported operating system: $(uname -s)"
-		echo ""
-		echo "${BIN_NAME} supports macOS and Linux."
-		echo "For other platforms, build from source with Rust:"
-		echo "  cargo install --git https://github.com/${REPO} --locked"
-		echo ""
+		log_error "Unsupported operating system: $(uname -s). ${BIN_NAME} supports Linux and macOS."
 		exit 1
 		;;
 	esac
-
 	case "$(uname -m)" in
-	x86_64 | amd64)   arch="amd64" ;;
-	aarch64 | arm64)  arch="arm64" ;;
+	x86_64 | amd64)  arch="amd64" ;;
+	aarch64 | arm64) arch="arm64" ;;
 	*)
-		log_error "Unsupported architecture: $(uname -m)"
-		echo ""
-		echo "${BIN_NAME} prebuilt binaries are available for amd64 and arm64."
-		echo "For other architectures, build from source with Rust:"
-		echo "  cargo install --git https://github.com/${REPO} --locked"
-		echo ""
+		log_error "Unsupported architecture: $(uname -m). Prebuilt binaries exist for amd64 and arm64."
+		echo "Build from source instead: cargo install --git https://github.com/${REPO} --locked" >&2
 		exit 1
 		;;
 	esac
-
-	echo "${os}-${arch}"
+	PLATFORM="${os}-${arch}"
 }
 
-fetch_release() {
-	local platform=$1
-	local tmp_dir=$2
-	local version="${CLAUDE_CODEX_VERSION:-}"
-
+# Sets RELEASE_VERSION. Non-zero when there is no release to install.
+resolve_version() {
+	local tmp=$1 version="${CLAUDE_CODEX_VERSION:-}"
 	if [ -z "$version" ]; then
-		log_info "Fetching latest release..."
-		local latest_url="https://api.github.com/repos/${REPO}/releases/latest"
-		local release_json
-
-		if command -v curl &>/dev/null; then
-			release_json=$(curl -fsSL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 30 "$latest_url")
-		elif command -v wget &>/dev/null; then
-			release_json=$(wget --tries=3 --timeout=30 -qO- "$latest_url")
-		else
-			log_error "Neither curl nor wget found. Please install one of them."
-			exit 1
+		log_info "Looking for the latest release..."
+		if ! download "https://api.github.com/repos/${REPO}/releases/latest" "$tmp/latest.json"; then
+			return 1
 		fi
-
-		version=$(echo "$release_json" | grep '"tag_name"' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' || true)
-
-		if [ -z "$version" ]; then
-			log_error "Failed to fetch latest version"
-			echo ""
-			echo "This might be due to network issues or GitHub API rate limits."
-			echo "You can specify a version manually:"
-			echo "  CLAUDE_CODEX_VERSION=v0.1.0 bash install.sh"
-			echo ""
-			exit 1
-		fi
+		version=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n 1)
+		[ -n "$version" ] || return 1
 	fi
-
-	log_info "Installing version: $version"
-
-	local archive_name="${BIN_NAME}-${platform}.tar.gz"
-	local download_url="https://github.com/${REPO}/releases/download/${version}/${archive_name}"
-
-	log_info "Downloading $archive_name..."
-
-	cd "$tmp_dir"
-	if command -v curl &>/dev/null; then
-		if ! curl -fsSL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 120 -o "$archive_name" "$download_url"; then
-			log_error "Download failed"
-			echo ""
-			echo "The release may not have a prebuilt binary for your platform."
-			echo ""
-			cd - >/dev/null || cd "$HOME"
-			exit 1
-		fi
-	elif command -v wget &>/dev/null; then
-		if ! wget --tries=3 --timeout=120 -q -O "$archive_name" "$download_url"; then
-			log_error "Download failed"
-			cd - >/dev/null || cd "$HOME"
-			exit 1
-		fi
-	fi
-
-	log_info "Verifying checksum..."
-	local checksum_file="${BIN_NAME}-${platform}.sha256"
-	local checksum_url="https://github.com/${REPO}/releases/download/${version}/${checksum_file}"
-
-	if command -v curl &>/dev/null; then
-		if ! curl -fsSL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 30 -o "$checksum_file" "$checksum_url"; then
-			log_error "Failed to download checksum file"
-			cd - >/dev/null || cd "$HOME"
-			exit 1
-		fi
-	elif command -v wget &>/dev/null; then
-		if ! wget --tries=3 --timeout=30 -q -O "$checksum_file" "$checksum_url"; then
-			log_error "Failed to download checksum file"
-			cd - >/dev/null || cd "$HOME"
-			exit 1
-		fi
-	fi
-
-	if command -v sha256sum &>/dev/null; then
-		if ! sha256sum -c "$checksum_file" &>/dev/null; then
-			log_error "Checksum verification failed"
-			cd - >/dev/null || cd "$HOME"
-			exit 1
-		fi
-	elif command -v shasum &>/dev/null; then
-		if ! shasum -a 256 -c "$checksum_file" &>/dev/null; then
-			log_error "Checksum verification failed"
-			cd - >/dev/null || cd "$HOME"
-			exit 1
-		fi
-	else
-		log_warning "Neither sha256sum nor shasum found, skipping checksum verification"
-	fi
-
-	log_success "Checksum verified"
-
-	log_info "Extracting archive..."
-	if ! tar -xzf "$archive_name"; then
-		log_error "Failed to extract archive"
-		exit 1
-	fi
-
+	case "$version" in
+	v*) ;;
+	*) version="v${version}" ;;
+	esac
 	RELEASE_VERSION="$version"
 }
 
-install_from_release() {
-	local platform=$1
-	TMP_DIR=$(mktemp -d)
-	trap 'rm -rf "${TMP_DIR:-}"' EXIT
-	local tmp_dir="$TMP_DIR"
-	local version
+verify_checksum() {
+	local dir=$1 file=$2
+	if have sha256sum; then
+		(cd "$dir" && sha256sum -c "$file" >/dev/null 2>&1)
+	elif have shasum; then
+		(cd "$dir" && shasum -a 256 -c "$file" >/dev/null 2>&1)
+	else
+		log_warning "Neither sha256sum nor shasum found: skipping checksum verification"
+	fi
+}
 
+# Download, verify and unpack a release into $1. Sets BIN_SRC.
+# Returns 1 when the release or the asset for this platform does not exist.
+fetch_release() {
+	local tmp=$1
+	resolve_version "$tmp" || return 1
+	local archive="${BIN_NAME}-${PLATFORM}.tar.gz"
+	local sum="${BIN_NAME}-${PLATFORM}.sha256"
+	local base="https://github.com/${REPO}/releases/download/${RELEASE_VERSION}"
+
+	log_info "Downloading ${archive} (${RELEASE_VERSION})..."
+	download "${base}/${archive}" "$tmp/${archive}" || return 1
+	download "${base}/${sum}" "$tmp/${sum}" || return 1
+	if ! verify_checksum "$tmp" "$sum"; then
+		log_error "Checksum verification failed for ${archive}. Nothing was installed."
+		exit 1
+	fi
+	log_success "Checksum verified"
+	mkdir -p "$tmp/unpacked"
+	if ! tar -xzf "$tmp/${archive}" -C "$tmp/unpacked" || [ ! -f "$tmp/unpacked/${BIN_NAME}" ]; then
+		log_error "The archive does not contain ${BIN_NAME}"
+		exit 1
+	fi
+	BIN_SRC="$tmp/unpacked/${BIN_NAME}"
+}
+
+build_from_source() {
+	local tmp=$1
+	log_info "Building with cargo (this takes a few minutes)..."
+	local args=(install --git "https://github.com/${REPO}" --locked --root "$tmp/cargo-root")
+	if [ -n "${CLAUDE_CODEX_VERSION:-}" ]; then
+		args+=(--tag "$RELEASE_VERSION")
+	fi
+	if ! cargo "${args[@]}" </dev/null; then
+		log_error "cargo install failed"
+		exit 1
+	fi
+	BIN_SRC="$tmp/cargo-root/bin/${BIN_NAME}"
+	RELEASE_VERSION="source"
+}
+
+obtain_binary() {
+	local tmp=$1
 	if [ -n "${CLAUDE_CODEX_LOCAL_BINARY:-}" ]; then
 		if [ ! -f "$CLAUDE_CODEX_LOCAL_BINARY" ]; then
 			log_error "CLAUDE_CODEX_LOCAL_BINARY does not exist: $CLAUDE_CODEX_LOCAL_BINARY"
 			exit 1
 		fi
-		log_info "Installing ${BIN_NAME} from local binary: $CLAUDE_CODEX_LOCAL_BINARY"
-		cp "$CLAUDE_CODEX_LOCAL_BINARY" "$tmp_dir/${BIN_NAME}"
-		version="local"
-		cd "$tmp_dir"
-	else
-		log_info "Installing ${BIN_NAME} from GitHub releases..."
-		fetch_release "$platform" "$tmp_dir"
-		version="$RELEASE_VERSION"
-	fi
-
-	local install_dir="${CLAUDE_CODEX_INSTALL_DIR:-}"
-	if [ -z "$install_dir" ]; then
-		if [[ -w /usr/local/bin ]]; then
-			install_dir="/usr/local/bin"
-		else
-			install_dir="$HOME/.local/bin"
-			mkdir -p "$install_dir"
-		fi
-	fi
-
-	mkdir -p "$install_dir" 2>/dev/null || true
-
-	if [ -f "$install_dir/${BIN_NAME}" ]; then
-		local existing_version
-		existing_version=$("$install_dir/${BIN_NAME}" --version 2>/dev/null | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' || echo "unknown")
-		log_info "Existing installation found: $existing_version"
-		log_info "Upgrading to: $version"
-	fi
-
-	log_info "Installing to $install_dir..."
-	local tmp_binary="$install_dir/${BIN_NAME}.tmp.$$"
-
-	if [[ -w "$install_dir" ]]; then
-		cp "${BIN_NAME}" "$tmp_binary"
-		chmod +x "$tmp_binary"
-		mv -f "$tmp_binary" "$install_dir/${BIN_NAME}"
-	else
-		if ! sudo cp "${BIN_NAME}" "$tmp_binary"; then
-			log_error "Failed to install to $install_dir (sudo required)"
-			exit 1
-		fi
-		sudo chmod +x "$tmp_binary"
-		sudo mv -f "$tmp_binary" "$install_dir/${BIN_NAME}"
-	fi
-
-	if [[ "$(uname -s)" == "Darwin" ]]; then
-		if command -v xattr &>/dev/null; then
-			xattr -d com.apple.quarantine "$install_dir/${BIN_NAME}" 2>/dev/null || true
-		fi
-		if command -v codesign &>/dev/null; then
-			codesign --remove-signature "$install_dir/${BIN_NAME}" 2>/dev/null || true
-			codesign --sign - --force "$install_dir/${BIN_NAME}" 2>/dev/null || true
-		fi
-	fi
-
-	log_success "${BIN_NAME} installed to $install_dir/${BIN_NAME}"
-
-	if [[ ":$PATH:" != *":$install_dir:"* ]]; then
-		log_warning "$install_dir is not in your PATH"
-		echo ""
-		echo "Add this to your shell profile (~/.bashrc, ~/.zshrc, etc.):"
-		echo "  export PATH=\"\$PATH:$install_dir\""
-		echo ""
-	fi
-
-	cd - >/dev/null || cd "$HOME"
-
-	INSTALL_DIR="$install_dir"
-}
-
-verify_installation() {
-	local install_dir="$1"
-
-	if [ ! -x "$install_dir/${BIN_NAME}" ]; then
-		log_error "${BIN_NAME} binary not found or not executable at $install_dir/${BIN_NAME}"
-		exit 1
-	fi
-
-	if ! "$install_dir/${BIN_NAME}" --version &>/dev/null; then
-		log_error "${BIN_NAME} binary exists but failed to run"
-		exit 1
-	fi
-
-	log_success "${BIN_NAME} is installed and ready!"
-	echo ""
-	"$install_dir/${BIN_NAME}" --version
-	echo ""
-}
-
-print_manual_steps() {
-	echo "Finish the setup yourself:"
-	echo "  ${BIN_NAME} enable              # service, subagent cards, Claude Code settings"
-	echo "  codex login                     # sign in to ChatGPT with the Codex CLI"
-	echo "  ${BIN_NAME} codex auth status   # confirm the proxy sees that login"
-	echo ""
-	echo "Documentation: https://github.com/${REPO}"
-	echo ""
-}
-
-run_setup() {
-	local install_dir="$1"
-
-	if [ "${CLAUDE_CODEX_NO_SETUP:-}" = "1" ]; then
-		log_info "Skipping setup (CLAUDE_CODEX_NO_SETUP=1)"
-		print_manual_steps
+		log_info "Using local binary: $CLAUDE_CODEX_LOCAL_BINARY"
+		BIN_SRC="$CLAUDE_CODEX_LOCAL_BINARY"
+		RELEASE_VERSION="local"
 		return 0
 	fi
-
-	log_info "Running ${BIN_NAME} enable..."
-	if "$install_dir/${BIN_NAME}" enable; then
-		log_success "Setup finished"
-		echo ""
-		echo "Switch it off any time with: ${BIN_NAME} disable (and back on with ${BIN_NAME} enable)"
-		echo "Remove everything with: ${BIN_NAME} uninstall"
-		echo "Documentation: https://github.com/${REPO}"
-		echo ""
-	else
-		log_warning "${BIN_NAME} is installed, but setup did not complete"
-		echo ""
-		echo "Fix the problem reported above and retry with:"
-		echo "  $install_dir/${BIN_NAME} enable"
-		echo ""
+	if fetch_release "$tmp"; then
+		return 0
 	fi
+	log_warning "No prebuilt ${PLATFORM} binary available from ${REPO} (no release yet, or none for this platform)."
+	if have cargo; then
+		build_from_source "$tmp"
+		return 0
+	fi
+	log_error "Could not get a binary."
+	cat >&2 <<EOF
+
+Two ways forward:
+  1. Check https://github.com/${REPO}/releases for a release with a ${PLATFORM} asset,
+     then rerun this script (pin one with CLAUDE_CODEX_VERSION=vX.Y.Z).
+  2. Install Rust from https://rustup.rs and rerun this script. It will build with:
+       cargo install --git https://github.com/${REPO} --locked
+EOF
+	exit 1
+}
+
+path_display() {
+	case "$1" in
+	"$HOME"/*) printf '%s/%s' "\$HOME" "${1#"$HOME"/}" ;;
+	*) printf '%s' "$1" ;;
+	esac
+}
+
+install_binary() {
+	local dir="${CLAUDE_CODEX_INSTALL_DIR:-$HOME/.local/bin}"
+	if ! mkdir -p "$dir" 2>/dev/null || [ ! -w "$dir" ]; then
+		log_error "$dir is not writable. This installer never uses sudo."
+		echo "Choose a directory you own: CLAUDE_CODEX_INSTALL_DIR=\$HOME/bin bash install.sh" >&2
+		exit 1
+	fi
+	if [ -x "$dir/${BIN_NAME}" ]; then
+		local existing
+		existing=$("$dir/${BIN_NAME}" --version 2>/dev/null </dev/null || echo "unknown version")
+		log_info "Replacing existing installation: $existing"
+	fi
+	local tmp_binary="$dir/${BIN_NAME}.tmp.$$"
+	cp "$BIN_SRC" "$tmp_binary"
+	chmod +x "$tmp_binary"
+	mv -f "$tmp_binary" "$dir/${BIN_NAME}"
+
+	if [ "$(uname -s)" = "Darwin" ]; then
+		if have xattr; then
+			xattr -d com.apple.quarantine "$dir/${BIN_NAME}" 2>/dev/null || true
+		fi
+		if have codesign; then
+			codesign --remove-signature "$dir/${BIN_NAME}" 2>/dev/null || true
+			codesign --sign - --force "$dir/${BIN_NAME}" 2>/dev/null || true
+		fi
+	fi
+
+	INSTALLED_BIN="$dir/${BIN_NAME}"
+	if ! "$INSTALLED_BIN" --version >/dev/null 2>&1 </dev/null; then
+		log_error "${INSTALLED_BIN} was installed but does not run"
+		exit 1
+	fi
+	log_success "Installed $("$INSTALLED_BIN" --version </dev/null) to $INSTALLED_BIN"
+
+	case ":$PATH:" in
+	*":$dir:"*) ;;
+	*)
+		log_warning "$dir is not in your PATH"
+		PENDING+=("Add the install directory to your PATH (put this line in ~/.bashrc or ~/.zshrc): export PATH=\"$(path_display "$dir"):\$PATH\"")
+		;;
+	esac
+}
+
+run_enable() {
+	if [ "${CLAUDE_CODEX_NO_SETUP:-}" = "1" ]; then
+		log_info "Skipping setup (CLAUDE_CODEX_NO_SETUP=1)"
+		ENABLE_STATE="skipped (CLAUDE_CODEX_NO_SETUP=1)"
+		PENDING+=("Run: $INSTALLED_BIN enable")
+		return 0
+	fi
+	log_info "Running ${BIN_NAME} enable..."
+	if "$INSTALLED_BIN" enable </dev/null; then
+		ENABLE_STATE="done"
+	else
+		ENABLE_STATE="incomplete"
+		log_warning "${BIN_NAME} is installed, but enable did not complete"
+		PENDING+=("Fix the problem reported above and retry: $INSTALLED_BIN enable")
+	fi
+}
+
+# The text after "<label>  " in the `status` output.
+status_field() {
+	printf '%s\n' "$STATUS" | sed -n "s/^$1  *//p" | head -n 1
+}
+
+check_codex_login() {
+	CODEX_LOGIN="missing"
+	CODEX_DETAIL=""
+	local out
+	if out=$("$INSTALLED_BIN" codex auth status 2>&1 </dev/null); then
+		CODEX_LOGIN="found"
+		CODEX_DETAIL=$(printf '%s\n' "$out" | sed -n -e 's/^Account: /account /p' -e 's/^Expires: \(.*\)$/access token expires \1/p' | paste -sd ';' - | sed 's/;/; /g')
+		return 0
+	fi
+	if have codex; then
+		PENDING+=("Sign in to ChatGPT with the Codex CLI: codex login")
+	else
+		PENDING+=("Install the Codex CLI (npm install -g @openai/codex, or brew install --cask codex), then sign in: codex login")
+	fi
+}
+
+check_claude_code() {
+	if have claude; then
+		CLAUDE_FOUND="found ($(command -v claude))"
+	else
+		CLAUDE_FOUND="not found in PATH"
+		PENDING+=("Install Claude Code (https://code.claude.com/docs/en/setup) and sign in with a Claude plan")
+	fi
+}
+
+print_summary() {
+	STATUS=""
+	if [ "$ENABLE_STATE" != "skipped (CLAUDE_CODEX_NO_SETUP=1)" ]; then
+		STATUS=$("$INSTALLED_BIN" status 2>&1 </dev/null || true)
+	fi
+	check_codex_login
+	check_claude_code
+
+	echo ""
+	echo "Summary"
+	printf '  %-13s %s\n' "binary" "$INSTALLED_BIN ($("$INSTALLED_BIN" --version </dev/null))"
+	printf '  %-13s %s\n' "enable" "$ENABLE_STATE"
+	if [ -n "$STATUS" ]; then
+		printf '  %-13s %s\n' "service" "$(status_field service)"
+		local linger
+		linger=$(status_field linger)
+		if [ -n "$linger" ]; then
+			printf '  %-13s %s\n' "linger" "$linger"
+		fi
+		printf '  %-13s %s\n' "agent cards" "$(status_field 'agent cards')"
+		printf '  %-13s %s\n' "Claude Code" "$(status_field 'Claude Code')"
+	fi
+	printf '  %-13s %s\n' "claude CLI" "$CLAUDE_FOUND"
+	if [ "$CODEX_LOGIN" = "found" ]; then
+		printf '  %-13s %s\n' "Codex login" "found${CODEX_DETAIL:+ ($CODEX_DETAIL)}"
+	else
+		printf '  %-13s %s\n' "Codex login" "not found"
+	fi
+
+	if [ "$ENABLE_STATE" = "done" ]; then
+		PENDING+=("Restart Claude Code so it picks up the new settings")
+	fi
+	echo ""
+	if [ "${#PENDING[@]}" -gt 0 ]; then
+		echo "Still to do:"
+		local item
+		for item in "${PENDING[@]}"; do
+			echo "  - $item"
+		done
+	else
+		log_success "Everything is set up."
+	fi
+	echo ""
+	echo "Switch off: ${BIN_NAME} disable    Remove: ${BIN_NAME} uninstall    Docs: https://github.com/${REPO}"
 }
 
 main() {
+	: "${HOME:?HOME is not set}"
+	TMP_DIR=$(mktemp -d)
+	trap cleanup EXIT
+
 	echo ""
 	echo "${BIN_NAME} installer"
 	echo ""
 
-	log_info "Detecting platform..."
-	local platform
-	platform=$(detect_platform)
-	log_info "Platform: $platform"
-
-	install_from_release "$platform"
-
-	verify_installation "$INSTALL_DIR"
-
-	run_setup "$INSTALL_DIR"
+	detect_platform
+	log_info "Platform: $PLATFORM"
+	obtain_binary "$TMP_DIR"
+	install_binary
+	run_enable
+	print_summary
 }
 
 main "$@"

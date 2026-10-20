@@ -10,6 +10,7 @@
 //! unless every location it can touch is redirected (see [`SANDBOX_REQUIRED`]).
 //! The integration tests always set it through a single helper.
 
+use crate::linger::{self, EnableOutcome, Loginctl};
 use crate::{agent_cards, config, paths, registry::Registry, service};
 use anyhow::{Context, Result, bail};
 use clap::Args;
@@ -85,6 +86,10 @@ pub struct SetupState {
     pub service_installed: bool,
     #[serde(default)]
     pub agents_synced: bool,
+    /// Setup turned systemd linger on (Linux), so `disable`/`uninstall` turn it
+    /// off again. Absent in records written by older versions.
+    #[serde(default)]
+    pub linger_enabled_by_setup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -624,23 +629,97 @@ fn service_step(args: &SetupArgs, state: &mut SetupState, report: &mut Report) -
         report
             .done
             .push("would install and start the autostart service".into());
+        if service::Platform::current() == service::Platform::Linux {
+            let system = linger::system();
+            linger_step(
+                system.as_ref().map(|s| s as &dyn Loginctl),
+                true,
+                state,
+                report,
+            );
+        }
         return Ok(());
     }
-    service::run_service_command(service::ServiceCommand::Install)?;
+    service::install_quiet()?;
     state.service_installed |= !existed;
     report
         .done
         .push("autostart service installed and started".into());
-    if cfg!(target_os = "linux")
-        && std::env::var_os(service::SERVICE_DIR_ENV).is_none()
-        && service::linger_enabled() == Some(false)
-    {
-        report.pending.push(
-            "To start the service at boot, not just at login, run: sudo loginctl enable-linger $USER"
-                .into(),
+    if service::Platform::current() == service::Platform::Linux {
+        let system = linger::system();
+        linger_step(
+            system.as_ref().map(|s| s as &dyn Loginctl),
+            false,
+            state,
+            report,
         );
     }
     Ok(())
+}
+
+/// Turn linger on so the service starts at boot, and record it when setup did.
+/// A failure is a pending item, never a failed step. `backend` is `None` where
+/// linger does not apply or must not be touched (sandbox), and then nothing is
+/// printed.
+pub(crate) fn linger_step(
+    backend: Option<&dyn Loginctl>,
+    dry_run: bool,
+    state: &mut SetupState,
+    report: &mut Report,
+) {
+    let Some(backend) = backend else { return };
+    match linger::ensure(backend, dry_run) {
+        EnableOutcome::AlreadyOn => report
+            .done
+            .push("linger already on (the service starts at boot)".into()),
+        EnableOutcome::WouldEnable => report.done.push(
+            "would enable linger with `loginctl enable-linger` so the service starts at boot"
+                .into(),
+        ),
+        EnableOutcome::Enabled => {
+            state.linger_enabled_by_setup = true;
+            report
+                .done
+                .push("linger enabled: the service starts at boot".into());
+        }
+        EnableOutcome::Failed(why) => report.pending.push(format!(
+            "Linger is off ({why}), so the service starts at login, not at boot. To start it at boot, {}",
+            linger::MANUAL_HINT
+        )),
+    }
+}
+
+/// Undo [`linger_step`] for `disable`, `uninstall` and `setup --undo`: linger is
+/// turned off only when `recorded` says setup turned it on. Returns
+/// `(failed, text)` for the report, or `None` when there is nothing to say
+/// (macOS). `recorded` is cleared when linger was turned off (or already off).
+pub(crate) fn release_linger(
+    backend: Option<&dyn Loginctl>,
+    recorded: &mut bool,
+    dry_run: bool,
+) -> Option<(bool, String)> {
+    if !*recorded {
+        return (service::Platform::current() == service::Platform::Linux)
+            .then(|| (false, "linger not touched: setup did not turn it on".into()));
+    }
+    let Some(backend) = backend else {
+        return Some((
+            false,
+            format!(
+                "linger left as it is: service manager calls are off ({} is set)",
+                service::SERVICE_DIR_ENV
+            ),
+        ));
+    };
+    let outcome = linger::release(backend, true, dry_run);
+    if matches!(
+        outcome,
+        linger::ReleaseOutcome::Released | linger::ReleaseOutcome::AlreadyOff
+    ) {
+        *recorded = false;
+    }
+    let failed = matches!(outcome, linger::ReleaseOutcome::Failed(_));
+    linger::release_message(&outcome).map(|text| (failed, text))
 }
 
 fn agents_step(args: &SetupArgs, state: &mut SetupState, report: &mut Report) -> Result<()> {
@@ -747,6 +826,18 @@ fn run_undo(args: &SetupArgs, loc: &Locations) -> Result<()> {
             }
         }
     }
+    if state.linger_enabled_by_setup && !args.no_service {
+        let mut recorded = true;
+        let system = linger::system();
+        let backend = system.as_ref().map(|s| s as &dyn Loginctl);
+        if let Some((failed, text)) = release_linger(backend, &mut recorded, args.dry_run) {
+            if failed {
+                report.failed.push(text);
+            } else {
+                report.done.push(text);
+            }
+        }
+    }
     if state.agents_synced && !args.no_agents {
         let result = agent_cards::agents_dir()
             .and_then(|dir| agent_cards::clean_once(&dir, args.dry_run).map(|a| (dir, a)));
@@ -812,7 +903,115 @@ fn run_undo(args: &SetupArgs, loc: &Locations) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linger::fake::FakeLoginctl;
     use serde_json::json;
+
+    fn linger_step_with(fake: &FakeLoginctl, dry_run: bool) -> (SetupState, Report) {
+        let mut state = SetupState::default();
+        let mut report = Report::default();
+        linger_step(Some(fake), dry_run, &mut state, &mut report);
+        (state, report)
+    }
+
+    #[test]
+    fn linger_already_on_is_not_recorded() {
+        let fake = FakeLoginctl::new(Some(true));
+        let (state, report) = linger_step_with(&fake, false);
+        assert!(!state.linger_enabled_by_setup);
+        assert!(report.done[0].contains("linger already on"));
+        assert!(report.pending.is_empty());
+        assert!(!fake.calls.borrow().contains(&"enable"));
+    }
+
+    #[test]
+    fn linger_enabled_by_setup_is_recorded() {
+        let fake = FakeLoginctl::new(Some(false));
+        let (state, report) = linger_step_with(&fake, false);
+        assert!(state.linger_enabled_by_setup);
+        assert!(report.done[0].contains("linger enabled"));
+        assert_eq!(fake.on.get(), Some(true));
+    }
+
+    #[test]
+    fn linger_failure_is_pending_with_the_manual_commands() {
+        let mut fake = FakeLoginctl::new(Some(false));
+        fake.enable_fails = true;
+        let (state, report) = linger_step_with(&fake, false);
+        assert!(!state.linger_enabled_by_setup);
+        assert!(report.failed.is_empty() && report.done.is_empty());
+        let text = &report.pending[0];
+        assert!(text.contains("`loginctl enable-linger`"), "{text}");
+        assert!(text.contains("sudo loginctl enable-linger $USER"), "{text}");
+    }
+
+    #[test]
+    fn linger_dry_run_changes_and_records_nothing() {
+        let fake = FakeLoginctl::new(Some(false));
+        let (state, report) = linger_step_with(&fake, true);
+        assert!(!state.linger_enabled_by_setup);
+        assert!(report.done[0].contains("would enable linger"));
+        assert_eq!(fake.on.get(), Some(false));
+    }
+
+    #[test]
+    fn linger_without_a_backend_prints_nothing() {
+        let mut state = SetupState::default();
+        let mut report = Report::default();
+        linger_step(None, false, &mut state, &mut report);
+        assert!(report.done.is_empty() && report.pending.is_empty());
+    }
+
+    #[test]
+    fn release_reverts_only_what_setup_recorded() {
+        let fake = FakeLoginctl::new(Some(true));
+        let mut recorded = false;
+        let out = release_linger(Some(&fake), &mut recorded, false);
+        assert!(fake.calls.borrow().is_empty());
+        assert_eq!(fake.on.get(), Some(true));
+        if let Some((failed, text)) = out {
+            assert!(
+                !failed && text.contains("setup did not turn it on"),
+                "{text}"
+            );
+        }
+
+        let mut recorded = true;
+        let (failed, text) = release_linger(Some(&fake), &mut recorded, false).unwrap();
+        assert!(!failed && text.contains("turned off"), "{text}");
+        assert!(!recorded);
+        assert_eq!(fake.on.get(), Some(false));
+    }
+
+    #[test]
+    fn release_dry_run_and_failure_keep_the_record() {
+        let fake = FakeLoginctl::new(Some(true));
+        let mut recorded = true;
+        let (_, text) = release_linger(Some(&fake), &mut recorded, true).unwrap();
+        assert!(text.starts_with("would turn linger off"), "{text}");
+        assert!(recorded && fake.on.get() == Some(true));
+
+        let mut fake = FakeLoginctl::new(Some(true));
+        fake.disable_fails = true;
+        let (failed, _) = release_linger(Some(&fake), &mut recorded, false).unwrap();
+        assert!(failed && recorded);
+    }
+
+    #[test]
+    fn release_without_a_backend_leaves_linger_and_record() {
+        let mut recorded = true;
+        let (failed, text) = release_linger(None, &mut recorded, false).unwrap();
+        assert!(!failed && recorded, "{text}");
+    }
+
+    #[test]
+    fn old_state_without_the_linger_field_still_reads() {
+        let state: SetupState =
+            serde_json::from_str(r#"{"service_installed":true,"agents_synced":true}"#).unwrap();
+        assert!(state.service_installed && !state.linger_enabled_by_setup);
+        let text = serde_json::to_string(&state).unwrap();
+        let back: SetupState = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, state);
+    }
 
     fn wanted() -> Vec<(&'static str, String)> {
         wanted_env(18765)

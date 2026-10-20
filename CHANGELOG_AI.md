@@ -2,6 +2,24 @@
 
 Past work done with AI assistance, newest first. Entries are not edited retroactively. The present state is described in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## 2026-10-20: automatic linger, single curl-bash installer, v0.6.0
+
+Why: the service was a systemd user unit but only started at login; `sudo loginctl enable-linger` was a manual step, and it turned out that plain `loginctl enable-linger` works for the user without sudo in a local session. The installer also needed to be one command that leaves everything configured.
+
+Added:
+
+- `src/linger.rs`: `Loginctl` trait (`is_enabled`, `enable`, `disable`), `SystemLoginctl`, `system()` (None off Linux and under `CCP_SERVICE_DIR`), `ensure`/`release` and a test-only `FakeLoginctl`. Never calls sudo.
+- `setup::linger_step` (after the service step, also in dry run), `setup::release_linger` used by `disable`, `setup --undo` and `uninstall` (new step "linger"); `SetupState.linger_enabled_by_setup` (serde default, so older `setup.json` still loads). Failure to enable is a "Still to do" item with `loginctl enable-linger` and the `sudo` form as alternative text. `status` shows `on (starts at boot; enabled by setup)`, `... not enabled by setup`, or `off`. `service::install_quiet` skips the hint of `service install`, which no longer says sudo.
+- Tests: 9 unit tests in `setup.rs` and 7 in `linger.rs` with the fake (already on, enabled, failure, dry run, release only when recorded, failure keeps the record, no backend, old JSON), 3 integration tests in `tests/setup.rs` (sandbox never touches or mentions linger; old record; record present in sandbox is kept and `loginctl` not run), 1 status unit test.
+- `scripts/install.sh` rewritten as the only installer (see ARCHITECTURE.md, "Installer and releases"). Tested in a sandbox with `CLAUDE_CODEX_LOCAL_BINARY`, a fake `curl` serving a release (good and bad checksum), a fake `cargo` for the fallback (404 release), no `cargo` at all (error with two options), non-writable install dir, `CLAUDE_CODEX_NO_SETUP=1`, login present and absent. `shellcheck` (shellcheck-py, installed `pip install shellcheck-py` in a temporary venv): clean.
+- Version 0.6.0 (Cargo.toml, Cargo.lock, CHANGELOG.md). `release.yml` got a step that checks the asset names. README rewritten, `docs/examples.md` added with real output (status, models, a card, two `claude -p` runs against the live proxy).
+
+Decisions and limits:
+
+- Linger is never disabled unless recorded; with `CCP_SERVICE_DIR` set and a record present, `disable` keeps the record and says linger was left as it is.
+- No release of `josefl03/claude-codex` exists yet (the API returned 404), so today the one-liner takes the `cargo install --git` path. Creating the `v0.6.0` tag is left to the maintainer.
+- Not verified: the real `loginctl enable-linger`/`disable-linger` calls from the new code (tests use a fake and the real machine's linger must stay on), macOS, and the release workflow itself (it only runs on a tag).
+
 ## 2026-10-18: `enable`/`disable`/`status` and `-latest` model aliases
 
 Why: the only ways to stop using the proxy were `setup --undo` (reverts the record) or `uninstall` (removes everything); there was no cheap off switch that keeps the install. And choosing "the newest sol" meant knowing the version and restarting Claude Code whenever a model came out.
