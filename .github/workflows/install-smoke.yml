@@ -30,7 +30,6 @@ jobs:
           - { name: "macOS Intel", runner: macos-15-intel }
     env:
       SMOKE_LABEL: ${{ matrix.name }} (${{ matrix.runner }})
-      SMOKE_DIR: ${{ runner.temp }}/install-smoke
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
@@ -56,7 +55,6 @@ jobs:
     timeout-minutes: 10
     env:
       SMOKE_LABEL: Windows (windows-latest, Git Bash)
-      SMOKE_DIR: ${{ runner.temp }}/install-smoke
     defaults:
       run:
         shell: bash
