@@ -287,11 +287,22 @@ lifecycle_uninstall() {
 # Pass 3 (macOS only): only Apple's own tools on PATH (BSD sed, mktemp, date, paste;
 # no sha256sum, so the installer must take its shasum branch), under /bin/bash 3.2.
 oneliner_apple_tools() {
-	local apple_path=/usr/bin:/bin:/usr/sbin:/sbin
-	env PATH="$apple_path" sh -c 'command -v sha256sum' >/dev/null 2>&1 && die "sha256sum is on the Apple-only PATH, the shasum branch would not be tested"
+	# Apple's own directories, minus anything named sha256sum (the macOS 15 runner image
+	# has one in the system directories too): a farm of symlinks to the real tools.
+	local farm="$SMOKE_DIR/applebin" d f
+	mkdir -p "$farm"
+	for d in /usr/bin /bin /usr/sbin /sbin; do
+		for f in "$d"/*; do
+			[ -x "$f" ] && [ -f "$f" ] || continue
+			[ "$(basename "$f")" = sha256sum ] && { say "left out: $f"; continue; }
+			ln -sf "$f" "$farm/$(basename "$f")" 2>/dev/null
+		done
+	done
+	local apple_path="$farm"
+	env PATH="$apple_path" sh -c 'command -v sha256sum' >/dev/null 2>&1 && die "sha256sum is still on the Apple-only PATH"
 	env PATH="$apple_path" sh -c 'command -v shasum' >/dev/null 2>&1 || die "shasum missing on the Apple-only PATH"
-	say "Apple-only PATH: no sha256sum, shasum at $(env PATH="$apple_path" sh -c 'command -v shasum')"
-	sed --version >/dev/null 2>&1 || say "(sed is BSD)"
+	say "Apple-only PATH ($farm): no sha256sum, shasum at $(readlink "$farm/shasum")"
+	say "sed here: $(readlink "$farm/sed" || echo "$farm/sed")"
 	/usr/bin/curl -fsSL "$INSTALL_URL" | sbx env PATH="$apple_path" /bin/bash 2>&1 | tee "$ROOT/pass3.log"
 	st=("${PIPESTATUS[@]}")
 	[ "${st[0]}" -eq 0 ] && [ "${st[1]}" -eq 0 ] || die "one-liner failed (pipeline statuses: ${st[*]})"
