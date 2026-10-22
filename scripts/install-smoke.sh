@@ -284,6 +284,28 @@ lifecycle_uninstall() {
 	say "uninstalled: binary, service definition and settings entry are gone"
 }
 
+# Pass 3 (macOS only): only Apple's own tools on PATH (BSD sed, mktemp, date, paste;
+# no sha256sum, so the installer must take its shasum branch), under /bin/bash 3.2.
+oneliner_apple_tools() {
+	local apple_path=/usr/bin:/bin:/usr/sbin:/sbin
+	env PATH="$apple_path" sh -c 'command -v sha256sum' >/dev/null 2>&1 && die "sha256sum is on the Apple-only PATH, the shasum branch would not be tested"
+	env PATH="$apple_path" sh -c 'command -v shasum' >/dev/null 2>&1 || die "shasum missing on the Apple-only PATH"
+	say "Apple-only PATH: no sha256sum, shasum at $(env PATH="$apple_path" sh -c 'command -v shasum')"
+	sed --version >/dev/null 2>&1 || say "(sed is BSD)"
+	/usr/bin/curl -fsSL "$INSTALL_URL" | sbx env PATH="$apple_path" /bin/bash 2>&1 | tee "$ROOT/pass3.log"
+	st=("${PIPESTATUS[@]}")
+	[ "${st[0]}" -eq 0 ] && [ "${st[1]}" -eq 0 ] || die "one-liner failed (pipeline statuses: ${st[*]})"
+}
+
+apple_tools_results() {
+	local log=$ROOT/pass3.log
+	grep -q "Checksum verified" "$log" || die "checksum was not verified with shasum"
+	if grep -q "skipping checksum verification" "$log"; then die "installer skipped the checksum"; fi
+	grep -Eq "enable +done" "$log" || die "enable did not complete"
+	grep -Eq "Codex login +found \(account toy" "$log" || die "Codex login detail not parsed with BSD sed/paste"
+	grep -E "Checksum|^  (enable|Codex login)" "$log"
+}
+
 phase_unix() {
 	LATEST=$(latest_tag)
 	[ -n "$LATEST" ] || { printf 'fail\tlatest release lookup\tno tag_name from the API\n' >>"$RESULTS"; return 1; }
@@ -321,6 +343,11 @@ phase_unix() {
 		check hard "status after enable" uses_status
 		check hard "disable keeps the unit, enable restores" lifecycle_disable_enable
 		check hard "uninstall removes everything" lifecycle_uninstall
+	fi
+	if [ "$(uname -s)" = Darwin ]; then
+		new_root
+		check hard "macOS: one-liner with only Apple tools on PATH (shasum, BSD sed/paste, bash 3.2)" oneliner_apple_tools
+		check hard "macOS: checksum via shasum and summary parsed with BSD tools" apple_tools_results
 	fi
 	return "$PHASE_FAILED"
 }
