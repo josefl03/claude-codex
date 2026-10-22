@@ -2,6 +2,21 @@
 
 Past work done with AI assistance, newest first. Entries are not edited retroactively. The present state is described in [ARCHITECTURE.md](ARCHITECTURE.md).
 
+## 2026-10-22: install and usage smoke on real runners
+
+Why: the installer and the binaries had only been run on Linux amd64. macOS, Linux arm64 and Windows were claimed, not tested, and a local VM was out of the question.
+
+Changed:
+
+- `.github/workflows/install-smoke.yml` (new; `workflow_dispatch`, `workflow_call`, weekly cron; `contents: read`, `fail-fast: false`, 10 and 15 minute timeouts) with jobs on `ubuntu-latest`, `ubuntu-24.04-arm`, `macos-15`, `macos-15-intel` and `windows-latest` (labels checked against the GitHub-hosted runners reference: free and unlimited for public repositories). `release.yml` calls it in a final `smoke` job.
+- `scripts/install-smoke.sh` (new, bash 3.2 compatible): `unix`, `service`, `windows` and `report` phases that record each check as ok/warn/fail and write a table to `$GITHUB_STEP_SUMMARY`. Real one-liner, isolated `HOME`, toy Codex login via `CCP_CODEX_AUTH_FILE`; usage checks; sandboxed `enable`/`disable`/`uninstall`; real service attempt with `continue-on-error`; macOS pass with an Apple-only `PATH`.
+- `scripts/install.sh`: refuses MINGW/MSYS/CYGWIN with a WSL 2 message, before the temp directory exists; resolves the latest tag from the `releases/latest` redirect (API as fallback).
+- Docs: README "Supported platforms", `docs/releasing.md` "Install smoke", `docs/development.md`, AGENTS.md, CHANGELOG.md.
+
+Found by the smoke: the first macOS arm64 run could not look up the latest release through the anonymous API and fell back to `cargo` (no Rust toolchain configured there), so the one-liner failed; the redirect lookup fixed it. My own smoke script had masking bugs (a `die` that did not exit, `PIPESTATUS` read twice, `uninstall` without `--yes`), fixed before the final runs. No Rust code changed, so no new version: the installer is served from `main`.
+
+Verified: run 39859052216 on `main`, all five jobs green, including the real systemd user service on both Linux runners and the real launchd agent on both macOS runners (each answered `/v1/models` on port 18765 and uninstalled). Not verified: Windows beyond the refusal (no Windows build exists; the service "not supported" check is a source check), boot-time or login-time autostart, and real Codex or Anthropic traffic (toy credentials only).
+
 ## 2026-10-20: prebuilt binaries and automatic releases
 
 Why: no release existed, so the one-liner always fell back to `cargo install`. The inherited `release.yml` only ran on `v*` tag pushes, built glibc binaries (the upstream once shipped one that demanded GLIBC 2.39) and had never run in this repository.

@@ -26,7 +26,7 @@ It talks to endpoints that those companies do not document for third-party use, 
 
 - Claude Code, signed in with a Claude plan (Pro or Max).
 - A ChatGPT plan (Plus, Pro or Team) with the Codex CLI installed and signed in (`codex login`).
-- Linux or macOS, on x86_64 or arm64. No Rust needed: the installer downloads a prebuilt binary.
+- Linux or macOS, on x86_64 or arm64 (Windows through WSL 2). No Rust needed: the installer downloads a prebuilt binary.
 
 ## Quickstart
 
@@ -36,23 +36,30 @@ One command installs the binary and sets everything up:
 curl -fsSL https://raw.githubusercontent.com/josefl03/claude-codex/main/scripts/install.sh | bash
 ```
 
-The script needs no sudo and asks nothing. It downloads the prebuilt binary for your platform from the latest [GitHub release](https://github.com/josefl03/claude-codex/releases), checks its SHA-256 and installs it into `~/.local/bin`, then runs `claude-codex enable`. That starts the autostart service, turns on systemd linger on Linux so the service also starts at boot (no privileges needed; `disable` and `uninstall` undo it), creates the subagent cards and points Claude Code at the proxy. It ends with a status table and what is left for you, such as restarting Claude Code. It checks the Codex login but never runs it for you.
+The script needs no sudo and asks nothing. It downloads the prebuilt binary from the latest [GitHub release](https://github.com/josefl03/claude-codex/releases), checks its SHA-256, installs it into `~/.local/bin` and runs `claude-codex enable`: autostart service, systemd linger on Linux (no privileges needed; `disable` and `uninstall` undo it), subagent cards, and Claude Code pointed at the proxy. It ends with a status table and what is left for you. It checks the Codex login but never runs it for you.
 
-Prebuilt binaries, one `.tar.gz` plus `.sha256` per platform and a combined `SHA256SUMS`:
-
-| Platform | Asset | Notes |
-|---|---|---|
-| Linux x86_64 | `claude-codex-linux-amd64.tar.gz` | static, runs on any distro |
-| Linux arm64 | `claude-codex-linux-arm64.tar.gz` | static, runs on any distro |
-| macOS Apple silicon | `claude-codex-darwin-arm64.tar.gz` | |
-| macOS Intel | `claude-codex-darwin-amd64.tar.gz` | |
-
-Windows has no binary. Cargo is only the alternative (the installer falls back to it when no asset matches and Rust is present):
+Prebuilt binaries ship as one `.tar.gz` plus `.sha256` per platform and a combined `SHA256SUMS`. Windows has no binary: use WSL 2 (the installer stops there with that advice). Cargo is only the fallback when no asset matches and Rust is present:
 
 ```sh
 cargo install --git https://github.com/josefl03/claude-codex --locked
 claude-codex enable
 ```
+
+### Supported platforms
+
+[![Install smoke](https://github.com/josefl03/claude-codex/actions/workflows/install-smoke.yml/badge.svg)](https://github.com/josefl03/claude-codex/actions/workflows/install-smoke.yml)
+
+The [install smoke](docs/releasing.md#install-smoke) workflow runs the real one-liner on GitHub-hosted runners weekly and after each release, with an isolated home and a toy Codex login. Last verified: v0.6.0, 2026-10-22.
+
+| Platform (runner) | Binary | Install and use | Autostart service | Limits |
+|---|---|---|---|---|
+| Linux x86_64 (`ubuntu-latest`) | `claude-codex-linux-amd64.tar.gz`, static | tested | systemd user unit started and answered `/v1/models` | none seen |
+| Linux arm64 (`ubuntu-24.04-arm`) | `claude-codex-linux-arm64.tar.gz`, static | tested | same as x86_64 | none seen |
+| macOS Apple silicon (`macos-15`) | `claude-codex-darwin-arm64.tar.gz` | tested, also with only Apple tools and bash 3.2 | launchd agent started and answered `/v1/models` | unsigned binary; the installer ad-hoc signs it |
+| macOS Intel (`macos-15-intel`) | `claude-codex-darwin-amd64.tar.gz` | tested, same as Apple silicon | same as Apple silicon | same |
+| Windows | none | the installer refuses with a pointer to WSL 2 and changes nothing | none | WSL 2 only, not tested here |
+
+"Tested" covers the checksum, `version`, `status`, `models`, `serve` plus `GET /v1/models`, `agents sync`, `enable`, `disable` and `uninstall` against redirected directories. Runners are headless and never reboot, so starting at boot or at login is not tested.
 
 How releases are published and verified: [docs/releasing.md](docs/releasing.md).
 
@@ -149,15 +156,15 @@ agent cards   21 managed in ~/.claude/agents
 Codex login   found
 ```
 
-`disable` stops and disables the service (the unit file stays), removes the managed cards and takes the entries it added out of `settings.json`, so Claude Code never points at a stopped proxy. If setup turned linger on, `disable` turns it off again; a linger you enabled yourself is left alone. The binary, logins, caches and setup record stay. Restart Claude Code after `disable` and after `enable`. What each command leaves behind is in [docs/usage.md](docs/usage.md#enable-disable-and-status).
+`disable` stops the service (the unit file stays), removes the managed cards and takes the entries it added out of `settings.json`. If setup turned linger on, `disable` turns it off; a linger you enabled yourself is left alone. The binary, logins and caches stay. Restart Claude Code after `disable` and `enable`. Details: [docs/usage.md](docs/usage.md#enable-disable-and-status).
 
 ### Uninstall
 
-`claude-codex uninstall` removes the service, the managed cards, what `setup` added to `settings.json`, and the binary. It asks first (`--yes` in scripts); `--dry-run`, `--keep-binary`, `--purge` and `--purge-credentials` adjust it. It never touches `~/.codex`, and it turns off linger only if setup turned it on.
+`claude-codex uninstall` removes the service, the managed cards, what `setup` added to `settings.json`, and the binary. It asks first (`--yes` in scripts); `--dry-run`, `--keep-binary`, `--purge` and `--purge-credentials` adjust it. It never touches `~/.codex`.
 
 ### New models appear on their own
 
-On start, and every 15 minutes after, the proxy asks the Codex backend which models your ChatGPT account can use, with the login the Codex CLI already stored. A new model becomes routable and gets a card; one that disappears loses its card. The result lives in the proxy's own state directory, never in `~/.codex`, and a failed refresh keeps the last good list. Force it with `claude-codex models --refresh`; `CCP_MODEL_DISCOVERY=0` turns it off. The `opus`, `sonnet`, `haiku` and `fable` aliases keep fixed preference lists. Details in [docs/usage.md](docs/usage.md#model-discovery).
+On start, and every 15 minutes after, the proxy asks the Codex backend which models your ChatGPT account can use, with the login the Codex CLI already stored. A new model becomes routable and gets a card; one that disappears loses its card. The list lives in the proxy's own state directory, never in `~/.codex`, and a failed refresh keeps the last good one. Force it with `claude-codex models --refresh`; `CCP_MODEL_DISCOVERY=0` turns it off. Details in [docs/usage.md](docs/usage.md#model-discovery).
 
 ## How it works
 
@@ -172,7 +179,7 @@ flowchart LR
     P -.->|"agent cards"| D["~/.claude/agents/<model>.md"]
 ```
 
-Claude models are relayed to Anthropic untouched, so prompt caching keeps working, and the proxy holds no Claude credentials. Codex models are translated to the OpenAI Responses API; refreshed tokens are written back to the Codex CLI's file so it keeps working. Reasoning survives a switch: earlier thinking reaches the next model as tagged plain text. More in [ARCHITECTURE.md](ARCHITECTURE.md).
+Claude models are relayed to Anthropic untouched, so prompt caching keeps working, and the proxy holds no Claude credentials. Codex models are translated to the OpenAI Responses API. Reasoning survives a switch: earlier thinking reaches the next model as tagged plain text. More in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ## What this fork adds
 
@@ -198,7 +205,7 @@ The listener has no inbound authentication: any process that can reach the port 
 
 ## When not to use it
 
-- You want an officially supported setup, need autostart on Windows, or cannot accept that unofficial endpoints may break.
+- You want an officially supported setup, need a native Windows install (WSL 2 only), or cannot accept that unofficial endpoints may break.
 
 Known limitation: switching plans in the middle of an active tool call can fail, because Anthropic requires a signed `thinking` block.
 
@@ -208,7 +215,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md), [docs/development.md](docs/development.m
 
 ## Credits
 
-Built on [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) (the server and the Codex translation) and [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex) (Claude passthrough, reasoning across switches, Codex CLI login). This fork adds the autostart service, `enable`/`disable`/`setup`, the subagent cards, the `-latest` aliases and the proxy's own model discovery.
+Built on [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) (server, Codex translation) and [fcakyon/claude-code-with-codex](https://github.com/fcakyon/claude-code-with-codex) (Claude passthrough, reasoning across switches, Codex CLI login).
 
 ## License
 

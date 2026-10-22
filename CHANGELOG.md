@@ -1,5 +1,13 @@
 ## Unreleased
 
+- New `install-smoke.yml` workflow (weekly, manual, and after every release): runs
+  the real one-liner on GitHub-hosted Linux amd64/arm64, macOS arm64/Intel and
+  Windows runners and uses the installed binary. See `docs/releasing.md`.
+- `scripts/install.sh` stops on Windows shells (MINGW, MSYS, Cygwin) with a clear
+  "use WSL 2" message before creating anything, and finds the latest release
+  through the `github.com/<repo>/releases/latest` redirect instead of the
+  rate-limited anonymous API (the API stays as fallback).
+- README: "Supported platforms" table with what the smoke actually verified.
 - Prebuilt binaries are now published: v0.6.0 is the first release, with
   `linux-amd64`, `linux-arm64`, `darwin-amd64` and `darwin-arm64` archives,
   a `.sha256` for each, a combined `SHA256SUMS` and build provenance
