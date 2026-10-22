@@ -102,6 +102,7 @@ tools_info() {
 		say "$t: $(command -v "$t" || echo '(absent)')"
 	done
 	sed --version >/dev/null 2>&1 && say "sed: GNU" || say "sed: BSD"
+	say "anonymous GitHub API budget of this runner IP: $(curl -s https://api.github.com/rate_limit | tr -d ' \n' | sed -n 's/.*"core":{\([^}]*\)}.*/\1/p')"
 	if [ "$(uname -s)" = Darwin ]; then
 		sw_vers
 		command -v sha256sum >/dev/null 2>&1 && say "note: sha256sum present, shasum branch not exercised" || say "sha256sum absent: installer must use the shasum branch"
@@ -453,7 +454,7 @@ phase_report() {
 		done <"$RESULTS"
 		echo ""
 		echo "⚠️ marks a runner limitation or an unconfirmed service attempt: the reason is in the detail and in the step log."
-	} >>"$out"
+	} | tee -a "$out"
 	grep -q '^fail' "$RESULTS" && return 1
 	return 0
 }

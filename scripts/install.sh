@@ -97,14 +97,26 @@ detect_platform() {
 }
 
 # Sets RELEASE_VERSION. Non-zero when there is no release to install.
+# The latest tag comes from the redirect of github.com/<repo>/releases/latest, not from
+# api.github.com: the API allows 60 anonymous requests per hour per IP address, and the
+# shared IP of a CI runner or an office exhausts that. The API is only the fallback.
 resolve_version() {
-	local tmp=$1 version="${CLAUDE_CODEX_VERSION:-}"
+	local tmp=$1 version="${CLAUDE_CODEX_VERSION:-}" url
 	if [ -z "$version" ]; then
 		log_info "Looking for the latest release..."
-		if ! download "https://api.github.com/repos/${REPO}/releases/latest" "$tmp/latest.json"; then
-			return 1
+		if have curl; then
+			url=$(curl -fsL --retry 3 --retry-connrefused --connect-timeout 10 --max-time 60 \
+				-o /dev/null -w '%{url_effective}' "https://github.com/${REPO}/releases/latest" </dev/null 2>/dev/null) || url=""
+			case "$url" in
+			*/releases/tag/*) version="${url##*/releases/tag/}" ;;
+			esac
 		fi
-		version=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n 1)
+		if [ -z "$version" ]; then
+			if ! download "https://api.github.com/repos/${REPO}/releases/latest" "$tmp/latest.json"; then
+				return 1
+			fi
+			version=$(sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' "$tmp/latest.json" | head -n 1)
+		fi
 		[ -n "$version" ] || return 1
 	fi
 	case "$version" in
