@@ -1,0 +1,69 @@
+name: Install smoke
+
+# Installs the latest published release with the real one-liner on real GitHub-hosted
+# runners and uses it. Free for public repositories; nothing is built or published.
+# scripts/install-smoke.sh holds the checks. See docs/releasing.md ("Install smoke").
+#
+# Runs: by hand, weekly, and after every release (release.yml calls it).
+
+on:
+  workflow_dispatch:
+  workflow_call:
+  schedule:
+    - cron: "23 5 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  unix:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: "Linux amd64 (reference)", runner: ubuntu-latest }
+          - { name: "Linux arm64", runner: ubuntu-24.04-arm }
+          - { name: "macOS arm64", runner: macos-15 }
+          - { name: "macOS Intel", runner: macos-15-intel }
+    env:
+      SMOKE_LABEL: ${{ matrix.name }} (${{ matrix.runner }})
+      SMOKE_DIR: ${{ runner.temp }}/install-smoke
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install and use (the real one-liner, isolated HOME, toy Codex login)
+        run: bash scripts/install-smoke.sh unix
+      - name: Real autostart service (may fail on a headless runner; reported, not hidden)
+        continue-on-error: true
+        run: bash scripts/install-smoke.sh service
+      - name: Summary
+        if: always()
+        run: bash scripts/install-smoke.sh report
+      - name: Keep the logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs-${{ matrix.runner }}
+          path: ${{ runner.temp }}/install-smoke/logs
+          retention-days: 7
+
+  windows:
+    name: Windows (refuses cleanly)
+    runs-on: windows-latest
+    timeout-minutes: 10
+    env:
+      SMOKE_LABEL: Windows (windows-latest, Git Bash)
+      SMOKE_DIR: ${{ runner.temp }}/install-smoke
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+      - name: The installer must refuse with a clear message and leave nothing
+        run: bash scripts/install-smoke.sh windows
+      - name: Summary
+        if: always()
+        run: bash scripts/install-smoke.sh report

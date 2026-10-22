@@ -206,3 +206,12 @@ jobs:
             --target "$SHA" \
             --title "$TAG" \
             --notes-file notes.md
+
+  smoke:
+    # Installs the release that was just published on Linux, macOS and Windows.
+    # A red run here means the release does not install somewhere.
+    name: Install smoke
+    needs: release
+    permissions:
+      contents: read
+    uses: ./.github/workflows/install-smoke.yml

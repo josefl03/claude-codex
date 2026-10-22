@@ -73,8 +73,14 @@ detect_platform() {
 	case "$(uname -s)" in
 	Darwin) os="darwin" ;;
 	Linux)  os="linux" ;;
+	MINGW* | MSYS* | CYGWIN* | Windows_NT)
+		log_error "Windows is not supported natively: ${BIN_NAME} has no Windows build and no Windows autostart service (this shell reports $(uname -s))."
+		echo "Use WSL 2 instead: run \`wsl --install\` in PowerShell (https://learn.microsoft.com/windows/wsl/install)," >&2
+		echo "then run this installer again inside the Linux shell. Nothing was installed." >&2
+		exit 1
+		;;
 	*)
-		log_error "Unsupported operating system: $(uname -s). ${BIN_NAME} supports Linux and macOS."
+		log_error "Unsupported operating system: $(uname -s). ${BIN_NAME} supports Linux and macOS (Windows through WSL 2)."
 		exit 1
 		;;
 	esac
@@ -336,14 +342,15 @@ print_summary() {
 
 main() {
 	: "${HOME:?HOME is not set}"
-	TMP_DIR=$(mktemp -d)
-	trap cleanup EXIT
 
 	echo ""
 	echo "${BIN_NAME} installer"
 	echo ""
 
+	# Before the temp directory exists: an unsupported system leaves nothing behind.
 	detect_platform
+	TMP_DIR=$(mktemp -d)
+	trap cleanup EXIT
 	log_info "Platform: $PLATFORM"
 	obtain_binary "$TMP_DIR"
 	install_binary
